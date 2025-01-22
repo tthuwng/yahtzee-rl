@@ -4,6 +4,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import wandb
 from IPython.display import clear_output
 from tqdm import tqdm
 
@@ -192,6 +193,18 @@ def train_yahtzee_agent(
     eval_interval: int = 5000,  # More frequent evaluation
 ) -> tuple:
     """Train a Yahtzee agent and return the trained agent + reward history."""
+    wandb.init(
+        project="yahtzee-rl",
+        config={
+            "num_episodes": num_episodes,
+            "use_boltzmann": use_boltzmann,
+            "batch_size": 512,
+            "gamma": 0.99,
+            "learning_rate": 1e-4,
+            "target_update": 500,
+        },
+    )
+
     env = YahtzeeEnv()
     encoder = StateEncoder()
 
@@ -221,6 +234,8 @@ def train_yahtzee_agent(
         state = env.reset()
         total_reward = 0.0
         done = False
+        episode_loss = 0.0
+        num_steps = 0
 
         while not done:
             state_vec = encoder.encode(state)
@@ -232,18 +247,20 @@ def train_yahtzee_agent(
             next_state, reward, done, _ = env.step(action_idx)
             next_state_vec = encoder.encode(next_state)
 
-            # Train DQN
-            agent.train_step(
+            loss = agent.train_step(
                 state_vec,
                 action_idx,
                 reward,
                 next_state_vec,
                 done,
             )
+            episode_loss += loss
+            num_steps += 1
 
             total_reward += reward
             state = next_state
 
+        avg_loss = episode_loss / max(num_steps, 1)
         all_rewards.append(total_reward)
         recent_scores.append(total_reward)
         if len(recent_scores) > 100:  # Shorter window
@@ -251,6 +268,18 @@ def train_yahtzee_agent(
 
         if total_reward > best_score:
             best_score = total_reward
+
+        metrics = {
+            "episode": episode,
+            "reward": total_reward,
+            "avg_loss": avg_loss,
+            "best_score": best_score,
+            "avg_score_100": np.mean(recent_scores),
+            "temperature" if use_boltzmann else "epsilon": (
+                agent.temperature if use_boltzmann else agent.epsilon
+            ),
+        }
+        wandb.log(metrics)
 
         # Update progress bar more frequently
         if (episode + 1) % 50 == 0:  # More frequent updates
@@ -280,11 +309,21 @@ def train_yahtzee_agent(
             stats = evaluate_agent(agent, num_games=50)  # Fewer eval games
             eval_stats.append(stats)
 
+            eval_metrics = {
+                "eval/mean_score": stats["mean"],
+                "eval/median_score": stats["median"],
+                "eval/std_score": stats["std"],
+                "eval/min_score": stats["min"],
+                "eval/max_score": stats["max"],
+            }
+            wandb.log(eval_metrics)
+
             if stats["mean"] > best_mean:
                 best_mean = stats["mean"]
                 plateau_counter = 0
                 # Save best model so far
                 agent.save("best_model.pth")
+                wandb.save("best_model.pth")
             else:
                 plateau_counter += 1
 
@@ -298,6 +337,7 @@ def train_yahtzee_agent(
                 f"Best Eval Mean: {best_mean:.1f}",
             )
 
+    wandb.finish()
     return agent, all_rewards, eval_stats
 
 
