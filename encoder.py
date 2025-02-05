@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Dict, Tuple
 
 import numpy as np
 
@@ -6,37 +6,123 @@ from env import Action, YahtzeeCategory
 
 
 class StateEncoder:
-    """
-    encodes the game state into a float vector for the neural net:
-    - current dice (5 values from 0..6 => normalize /6.0)
-    - rolls_left (1 float, 0..3 => /3)
-    - which categories are filled? (13 binary flags)
-    - normalized scores in each category (13 values, /50.0)
-    Total size = 5 + 1 + 13 + 13 = 32
-    """
+    """Encodes game state into a vector with enhanced features for better learning."""
 
-    def __init__(self):
-        self.state_size = 32
+    def __init__(self) -> None:
         self.categories = list(YahtzeeCategory)
+        # Expanded state size to include more informative features
+        self.state_size = (
+            5 +      # Current dice values
+            1 +      # Rolls left
+            13 +     # Category filled flags
+            13 +     # Category scores
+            6 +      # Dice value counts
+            1 +      # Upper section total
+            1 +      # Upper bonus eligibility
+            6 +      # Potential upper section scores
+            5        # Potential combination scores (3K, 4K, FH, SS, LS)
+        )           # Total: 51 features
+
+    def _get_dice_counts(self, dice: np.ndarray) -> np.ndarray:
+        """Get normalized counts of each dice value."""
+        counts = np.zeros(6)
+        for i in range(6):
+            counts[i] = np.sum(dice == (i + 1))
+        return counts / 5.0  # Normalize by max possible count
+
+    def _get_upper_section_total(self, scores: Dict[YahtzeeCategory, int]) -> float:
+        """Calculate normalized upper section total."""
+        upper_cats = [
+            YahtzeeCategory.ONES,
+            YahtzeeCategory.TWOS,
+            YahtzeeCategory.THREES,
+            YahtzeeCategory.FOURS,
+            YahtzeeCategory.FIVES,
+            YahtzeeCategory.SIXES
+        ]
+        total = sum(scores[cat] or 0 for cat in upper_cats)
+        return min(total / 63.0, 1.0)  # Normalize by bonus threshold
+
+    def _get_potential_scores(self, dice: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Calculate potential scores for unfilled categories."""
+        # Upper section potential scores
+        upper_scores = np.zeros(6)
+        for i in range(6):
+            count = np.sum(dice == (i + 1))
+            upper_scores[i] = count * (i + 1) / 30.0  # Normalize by max possible (5 * 6 = 30)
+        
+        # Combination scores
+        combo_scores = np.zeros(5)
+        if any(dice):  # Only calculate if dice are showing
+            counts = np.bincount(dice)[1:] if any(dice) else []
+            dice_sum = dice.sum()
+            
+            # Three of a Kind
+            combo_scores[0] = dice_sum / 30.0 if any(c >= 3 for c in counts) else 0
+            
+            # Four of a Kind
+            combo_scores[1] = dice_sum / 30.0 if any(c >= 4 for c in counts) else 0
+            
+            # Full House
+            combo_scores[2] = 25.0 / 25.0 if any(c == 3 for c in counts) and any(c == 2 for c in counts) else 0
+            
+            # Small Straight
+            sorted_unique = np.unique(dice)
+            for straight in [[1,2,3,4], [2,3,4,5], [3,4,5,6]]:
+                if all(x in sorted_unique for x in straight):
+                    combo_scores[3] = 30.0 / 30.0
+                    break
+            
+            # Large Straight
+            if len(sorted_unique) == 5 and (
+                all(x in sorted_unique for x in [1,2,3,4,5]) or
+                all(x in sorted_unique for x in [2,3,4,5,6])
+            ):
+                combo_scores[4] = 40.0 / 40.0
+        
+        return upper_scores, combo_scores
 
     def encode(self, state) -> np.ndarray:
+        """Convert game state to enhanced vector representation."""
         vec = np.zeros(self.state_size, dtype=np.float32)
+        idx = 0
 
-        # encode dice values (normalized by 6)
-        vec[0:5] = state.current_dice / 6.0
+        # Dice values (normalized)
+        vec[idx:idx+5] = state.current_dice / 6.0
+        idx += 5
 
-        # encode rolls left (normalized by 3)
-        vec[5] = state.rolls_left / 3.0
+        # Rolls left (normalized)
+        vec[idx] = state.rolls_left / 3.0
+        idx += 1
 
-        # encode which categories are filled and their scores
-        offset_filled = 6
-        offset_scores = offset_filled + 13
-        for i, cat in enumerate(self.categories):
+        # Category flags and scores
+        for cat in self.categories:
             score = state.score_sheet[cat]
-            if score is not None:
-                vec[offset_filled + i] = 1.0
-                # normalize score by 50 (max possible in any category)
-                vec[offset_scores + i] = min(score, 50) / 50.0
+            vec[idx] = 1.0 if score is not None else 0.0  # Category filled flag
+            vec[idx + 13] = min(score / 50.0, 1.0) if score is not None else 0.0  # Normalized score
+        idx += 26  # 13 flags + 13 scores
+
+        # Dice value counts
+        vec[idx:idx+6] = self._get_dice_counts(state.current_dice)
+        idx += 6
+
+        # Upper section progress
+        vec[idx] = self._get_upper_section_total(state.score_sheet)
+        idx += 1
+
+        # Upper bonus eligibility
+        upper_total = sum(
+            state.score_sheet[cat] or 0
+            for cat in self.categories[:6]  # Upper section categories
+        )
+        vec[idx] = 1.0 if upper_total >= 63 else upper_total / 63.0
+        idx += 1
+
+        # Potential scores for unfilled categories
+        upper_scores, combo_scores = self._get_potential_scores(state.current_dice)
+        vec[idx:idx+6] = upper_scores
+        idx += 6
+        vec[idx:idx+5] = combo_scores
 
         return vec
 

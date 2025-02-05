@@ -1,7 +1,8 @@
+import os
 import time
+from datetime import datetime
 from typing import Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import wandb
@@ -10,26 +11,26 @@ from tqdm import tqdm
 
 from dqn import YahtzeeAgent
 from encoder import StateEncoder
-from env import NUM_ACTIONS, ActionType, GameState, YahtzeeEnv
-from utils import is_colab, plot_training_progress, save_to_colab
+from env import (
+    IDX_TO_ACTION,
+    NUM_ACTIONS,
+    ActionType,
+    GameState,
+    YahtzeeCategory,
+    YahtzeeEnv,
+)
+from utils import plot_training_progress
 
 
 def evaluate_agent(agent: YahtzeeAgent, num_games: int = 100) -> dict:
-    """
-    Evaluate agent performance across multiple games.
-    Returns dict with detailed statistics.
-    """
+    """Evaluate agent performance across multiple games."""
     env = YahtzeeEnv()
     encoder = StateEncoder()
     scores = []
 
-    # Store original temperature/epsilon
-    if agent.use_boltzmann:
-        old_temp = agent.temperature
-        agent.temperature = 0.01  # Nearly deterministic
-    else:
-        old_eps = agent.epsilon
-        agent.epsilon = 0.01
+    # Store original state and set to eval mode
+    was_training = agent.training_mode
+    agent.eval()
 
     # Run evaluation games
     for _ in range(num_games):
@@ -43,18 +44,15 @@ def evaluate_agent(agent: YahtzeeAgent, num_games: int = 100) -> dict:
             if not valid_actions:
                 break
 
-            # Use greedy action selection
-            action_idx = agent.select_action_greedy(state_vec, valid_actions)
+            action_idx = agent.select_action(state_vec, valid_actions)
             state, reward, done, _ = env.step(action_idx)
             total_reward += reward
 
         scores.append(total_reward)
 
-    # Restore exploration parameters
-    if agent.use_boltzmann:
-        agent.temperature = old_temp
-    else:
-        agent.epsilon = old_eps
+    # Restore original state
+    if was_training:
+        agent.train()
 
     # Calculate statistics
     scores = np.array(scores)
@@ -62,40 +60,13 @@ def evaluate_agent(agent: YahtzeeAgent, num_games: int = 100) -> dict:
         "mean": np.mean(scores),
         "median": np.median(scores),
         "std": np.std(scores),
-        "min": np.min(scores),
         "max": np.max(scores),
-        "scores": scores,
+        "min": np.min(scores),
     }
 
-    # Print detailed results
-    print("\nEvaluation Results:")
-    print(f"Mean Score: {stats['mean']:.1f}")
-    print(f"Median Score: {stats['median']:.1f}")
-    print(f"Std Dev: {stats['std']:.1f}")
-    print(f"Min Score: {stats['min']:.1f}")
-    print(f"Max Score: {stats['max']:.1f}")
-
-    # Plot score distribution
-    plt.figure(figsize=(10, 5))
-    plt.hist(scores, bins=20, edgecolor="black")
-    plt.axvline(
-        stats["mean"],
-        color="red",
-        linestyle="dashed",
-        label=f"Mean ({stats['mean']:.1f})",
+    print(
+        f"\nEval Mean: {stats['mean']:.1f} ± {stats['std']:.1f}, Max: {stats['max']:.1f}, Min: {stats['min']:.1f}"
     )
-    plt.axvline(
-        stats["median"],
-        color="green",
-        linestyle="dashed",
-        label=f"Median ({stats['median']:.1f})",
-    )
-    plt.title("Score Distribution")
-    plt.xlabel("Score")
-    plt.ylabel("Count")
-    plt.legend()
-    plt.show()
-
     return stats
 
 
@@ -106,6 +77,10 @@ def quick_validation_training(
     eval_interval: int = 500,  # More frequent evaluation
 ) -> tuple:
     """Quick training loop for validating the approach."""
+    # Generate unique run name with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"yahtzee_quick_val_{timestamp}"
+
     env = YahtzeeEnv()
     encoder = StateEncoder()
 
@@ -117,7 +92,6 @@ def quick_validation_training(
         gamma=0.99,
         learning_rate=2e-4,  # Slightly higher learning rate
         target_update=250,  # More frequent target updates
-        use_boltzmann=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
@@ -125,6 +99,12 @@ def quick_validation_training(
     all_rewards = []
     best_mean = 0
     eval_stats = []
+    best_model_path = None
+
+    # Create models directory if it doesn't exist
+    models_dir = "models"
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
 
     # Training loop with progress bar
     progress = tqdm(range(num_episodes), desc="Validation Training")
@@ -160,9 +140,7 @@ def quick_validation_training(
         # Update progress more frequently
         if (episode + 1) % 50 == 0:
             avg_score = np.mean(all_rewards[-50:])
-            progress.set_postfix(
-                {"Avg": f"{avg_score:.1f}", "Temp": f"{agent.temperature:.3f}"}
-            )
+            progress.set_postfix({"Avg": f"{avg_score:.1f}"})
 
         # Evaluate periodically
         if (episode + 1) % eval_interval == 0:
@@ -172,7 +150,15 @@ def quick_validation_training(
 
             if stats["mean"] > best_mean:
                 best_mean = stats["mean"]
-                agent.save("quick_val_best.pth")
+                # Save only the best model with score in filename
+                model_path = os.path.join(
+                    models_dir, f"{run_name}_score{int(stats['mean'])}.pth"
+                )
+                agent.save(model_path)
+                # Update best model path
+                if best_model_path and os.path.exists(best_model_path):
+                    os.remove(best_model_path)  # Remove old best model
+                best_model_path = model_path
 
             plot_training_progress(
                 all_rewards,
@@ -186,67 +172,241 @@ def quick_validation_training(
     return agent, all_rewards, eval_stats
 
 
-def train_yahtzee_agent(
-    num_episodes: int = 50000,  # Reduced episodes
-    use_boltzmann: bool = True,
-    plot_interval: int = 1000,  # More frequent plotting
-    eval_interval: int = 5000,  # More frequent evaluation
-) -> tuple:
-    """Train a Yahtzee agent and return the trained agent + reward history."""
+def get_latest_checkpoint(run_id: str) -> Optional[str]:
+    """Find the latest checkpoint for a given run ID."""
+    models_dir = "models"
+    checkpoints = [
+        f
+        for f in os.listdir(models_dir)
+        if f.startswith(f"yahtzee_run_{run_id}_checkpoint_")
+    ]
+    if not checkpoints:
+        return None
+
+    # Sort by step number
+    checkpoints.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
+    return os.path.join(models_dir, checkpoints[-1])
+
+
+def calculate_strategic_reward(
+    env: YahtzeeEnv, category: YahtzeeCategory, score: float
+) -> float:
+    """Calculate strategic reward based on Yahtzee best practices."""
+    base_reward = score
+    bonus_reward = 0.0
+
+    # Track upper section progress
+    upper_score = sum(
+        env.state.score_sheet[cat] or 0
+        for cat in [
+            YahtzeeCategory.ONES,
+            YahtzeeCategory.TWOS,
+            YahtzeeCategory.THREES,
+            YahtzeeCategory.FOURS,
+            YahtzeeCategory.FIVES,
+            YahtzeeCategory.SIXES,
+        ]
+    )
+
+    # Count remaining upper categories
+    upper_remaining = sum(
+        1
+        for cat in [
+            YahtzeeCategory.ONES,
+            YahtzeeCategory.TWOS,
+            YahtzeeCategory.THREES,
+            YahtzeeCategory.FOURS,
+            YahtzeeCategory.FIVES,
+            YahtzeeCategory.SIXES,
+        ]
+        if env.state.score_sheet[cat] is None
+    )
+
+    if upper_remaining > 0:
+        points_needed = max(0, 63 - upper_score)
+        avg_needed = points_needed / upper_remaining
+
+        # Reward for good upper section progress
+        if category in [
+            YahtzeeCategory.ONES,
+            YahtzeeCategory.TWOS,
+            YahtzeeCategory.THREES,
+            YahtzeeCategory.FOURS,
+            YahtzeeCategory.FIVES,
+            YahtzeeCategory.SIXES,
+        ]:
+            if score >= avg_needed:
+                bonus_reward += 5.0  # Bonus for meeting/exceeding average needed
+            elif score > 0:
+                bonus_reward += 2.0  # Small bonus for any positive score
+
+    # Extra rewards for key achievements
+    if category == YahtzeeCategory.YAHTZEE and score == 50:
+        bonus_reward += 10.0  # Big bonus for Yahtzee
+    elif category == YahtzeeCategory.LARGE_STRAIGHT and score == 40:
+        bonus_reward += 5.0  # Bonus for Large Straight
+    elif category == YahtzeeCategory.SMALL_STRAIGHT and score == 30:
+        bonus_reward += 3.0  # Bonus for Small Straight
+    elif category == YahtzeeCategory.FULL_HOUSE and score == 25:
+        bonus_reward += 2.0  # Bonus for Full House
+
+    # Penalty for wasting good combinations
+    if score == 0 and category not in [YahtzeeCategory.CHANCE]:
+        counts = (
+            np.bincount(env.state.current_dice)[1:]
+            if any(env.state.current_dice)
+            else []
+        )
+        if any(c >= 3 for c in counts) or len(np.unique(env.state.current_dice)) >= 4:
+            bonus_reward -= 5.0  # Penalty for wasting good combinations
+
+    return base_reward + bonus_reward
+
+
+def load_checkpoint(
+    checkpoint_path: str, agent: YahtzeeAgent, device: torch.device
+) -> int:
+    print(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    try:
+        agent.policy_net.load_state_dict(checkpoint["policy_net"])
+        agent.target_net.load_state_dict(checkpoint["target_net"])
+        agent.optimizer.load_state_dict(checkpoint["optimizer"])
+        start_episode = checkpoint["episode"]
+    except KeyError:
+        print("Loading legacy checkpoint format...")
+        agent.policy_net.load_state_dict(checkpoint)
+        agent.target_net.load_state_dict(checkpoint)
+        try:
+            start_episode = int(checkpoint_path.split("_")[-1].split(".")[0])
+        except (ValueError, IndexError):
+            start_episode = 0
+
+    print(f"Resuming from episode {start_episode}")
+    return start_episode
+
+
+def save_checkpoint(
+    agent: YahtzeeAgent,
+    episode: int,
+    run_id: str,
+    metrics: dict,
+    is_best: bool = False,
+) -> str:
+    """Save checkpoint with consistent format and metrics."""
+    models_dir = "models"
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
+
+    # Save full training state
+    checkpoint = {
+        "episode": episode,
+        "policy_net": agent.policy_net.state_dict(),
+        "target_net": agent.target_net.state_dict(),
+        "optimizer": agent.optimizer.state_dict(),
+        "metrics": metrics,
+        "epsilon": agent.epsilon,
+    }
+
+    if is_best:
+        score = int(metrics["eval_score"])
+        filename = f"{models_dir}/yahtzee_run_{run_id}_score{score}.pth"
+    else:
+        filename = f"{models_dir}/yahtzee_run_{run_id}_checkpoint_{episode}.pth"
+
+    torch.save(checkpoint, filename)
+    print(f"Saved model to: {filename}")
+    return filename
+
+
+def train(
+    run_id: Optional[str] = None,
+    checkpoint_path: Optional[str] = None,
+    num_episodes: int = 100000,
+    checkpoint_freq: int = 5000,
+    eval_freq: int = 1000,
+    num_eval_episodes: int = 100,
+    patience: int = 5,
+    min_improvement: float = 1.0,
+) -> None:
+    if run_id is None:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    config = {
+        "num_episodes": num_episodes,
+        "checkpoint_freq": checkpoint_freq,
+        "eval_freq": eval_freq,
+        "num_eval_episodes": num_eval_episodes,
+        "patience": patience,
+        "min_improvement": min_improvement,
+    }
+
     wandb.init(
         project="yahtzee-rl",
-        config={
-            "num_episodes": num_episodes,
-            "use_boltzmann": use_boltzmann,
-            "batch_size": 512,
-            "gamma": 0.99,
-            "learning_rate": 1e-4,
-            "target_update": 500,
-        },
+        name=f"yahtzee_run_{run_id}",
+        config=config,
+        resume=checkpoint_path is not None,
     )
 
     env = YahtzeeEnv()
     encoder = StateEncoder()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Instantiate agent with optimized parameters
+    # Adjusted hyperparameters for improved performance
     agent = YahtzeeAgent(
         state_size=encoder.state_size,
         action_size=NUM_ACTIONS,
-        batch_size=512,  # Smaller batch size
-        gamma=0.99,  # Slightly lower discount
-        learning_rate=1e-4,  # Higher learning rate
-        target_update=500,  # More frequent updates
-        use_boltzmann=use_boltzmann,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        batch_size=1024,  # Increased batch size
+        gamma=0.995,  # Slightly higher discount factor
+        learning_rate=1e-4,  # Lower learning rate for stability
+        target_update=250,  # More frequent target updates
+        device=device,
     )
 
-    # Training metrics
-    all_rewards = []
-    best_score = 0
-    recent_scores = []
-    eval_stats = []
-    plateau_counter = 0
-    best_mean = 0
+    start_episode = 0
+    metrics = {
+        "best_eval_score": float("-inf"),
+        "patience_counter": 0,
+        "episode_rewards": [],
+        "eval_scores": [],
+        "losses": [],
+    }
 
-    # Training loop with progress bar
-    progress = tqdm(range(num_episodes), desc="Training")
+    if checkpoint_path:
+        print(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        agent.policy_net.load_state_dict(checkpoint["policy_net"])
+        agent.target_net.load_state_dict(checkpoint["target_net"])
+        agent.optimizer.load_state_dict(checkpoint["optimizer"])
+        agent.epsilon = checkpoint.get("epsilon", agent.epsilon)
+        metrics.update(checkpoint.get("metrics", {}))
+        start_episode = checkpoint["episode"]
+        print(f"Resuming from episode {start_episode}")
+
+    last_save_time = time.time()
+    progress = tqdm(range(start_episode, num_episodes), desc="Training")
+
     for episode in progress:
         state = env.reset()
-        total_reward = 0.0
-        done = False
-        episode_loss = 0.0
-        num_steps = 0
+        total_reward = 0
+        episode_losses = []
 
-        while not done:
+        while True:
             state_vec = encoder.encode(state)
             valid_actions = env.get_valid_actions()
+
             if not valid_actions:
                 break
 
             action_idx = agent.select_action(state_vec, valid_actions)
+            action = env.idx_to_action[action_idx]
             next_state, reward, done, _ = env.step(action_idx)
-            next_state_vec = encoder.encode(next_state)
 
+            if action.kind == ActionType.SCORE:
+                reward = calculate_strategic_reward(env, action.data, reward)
+
+            next_state_vec = encoder.encode(next_state)
             loss = agent.train_step(
                 state_vec,
                 action_idx,
@@ -254,98 +414,129 @@ def train_yahtzee_agent(
                 next_state_vec,
                 done,
             )
-            episode_loss += loss
-            num_steps += 1
 
-            total_reward += reward
+            if loss is not None:
+                episode_losses.append(loss)
+
             state = next_state
+            total_reward += reward
 
-        avg_loss = episode_loss / max(num_steps, 1)
-        all_rewards.append(total_reward)
-        recent_scores.append(total_reward)
-        if len(recent_scores) > 100:  # Shorter window
-            recent_scores.pop(0)
+            if done:
+                break
 
-        if total_reward > best_score:
-            best_score = total_reward
+        metrics["episode_rewards"].append(total_reward)
+        if episode_losses:
+            metrics["losses"].append(np.mean(episode_losses))
 
-        metrics = {
-            "episode": episode,
-            "reward": total_reward,
-            "avg_loss": avg_loss,
-            "best_score": best_score,
-            "avg_score_100": np.mean(recent_scores),
-            "temperature" if use_boltzmann else "epsilon": (
-                agent.temperature if use_boltzmann else agent.epsilon
-            ),
-        }
-        wandb.log(metrics)
+        wandb.log(
+            {
+                "episode": episode,
+                "reward": total_reward,
+                "epsilon": agent.epsilon,
+                "loss": np.mean(episode_losses) if episode_losses else None,
+            },
+            step=episode,
+        )
 
-        # Update progress bar more frequently
-        if (episode + 1) % 50 == 0:  # More frequent updates
-            avg_score = np.mean(recent_scores)
-            if use_boltzmann:
-                temp = agent.temperature
-                progress.set_postfix(
-                    {
-                        "Avg": f"{avg_score:.1f}",
-                        "Best": f"{best_score:.1f}",
-                        "Temp": f"{temp:.3f}",
-                    }
-                )
+        if len(metrics["episode_rewards"]) >= 100:
+            mean_100 = np.mean(metrics["episode_rewards"][-100:])
+            best_score = metrics["best_eval_score"]
+            patience = metrics["patience_counter"]
+            progress.set_postfix(
+                {
+                    "Mean100": f"{mean_100:.1f}",
+                    "Best": f"{best_score:.1f}",
+                    "Patience": patience,
+                }
+            )
+
+        if (episode + 1) % eval_freq == 0:
+            agent.eval()
+            eval_rewards = []
+
+            for _ in range(num_eval_episodes):
+                eval_reward = evaluate_episode(agent, env, encoder)
+                eval_rewards.append(eval_reward)
+
+            mean_eval_score = np.mean(eval_rewards)
+            metrics["eval_scores"].append(mean_eval_score)
+
+            wandb.log(
+                {
+                    "eval_score": mean_eval_score,
+                    "eval_score_std": np.std(eval_rewards),
+                },
+                step=episode,
+            )
+
+            if mean_eval_score > metrics["best_eval_score"] + min_improvement:
+                metrics["best_eval_score"] = mean_eval_score
+                metrics["patience_counter"] = 0
+                filename = save_checkpoint(agent, episode, run_id, metrics, True)
+                wandb.save(filename)
+                print(f"\nNew best score: {metrics['best_eval_score']:.1f}")
             else:
-                eps = agent.epsilon
-                progress.set_postfix(
-                    {
-                        "Avg": f"{avg_score:.1f}",
-                        "Best": f"{best_score:.1f}",
-                        "Eps": f"{eps:.3f}",
-                    }
-                )
+                metrics["patience_counter"] += 1
+                if metrics["patience_counter"] >= patience:
+                    msg = (
+                        f"\nEarly stopping after {patience} evaluations "
+                        "without improvement"
+                    )
+                    print(msg)
+                    break
 
-        # More frequent evaluation
-        if (episode + 1) % eval_interval == 0:
-            print(f"\nEvaluating at episode {episode + 1}...")
-            stats = evaluate_agent(agent, num_games=50)  # Fewer eval games
-            eval_stats.append(stats)
+            agent.train()
 
-            eval_metrics = {
-                "eval/mean_score": stats["mean"],
-                "eval/median_score": stats["median"],
-                "eval/std_score": stats["std"],
-                "eval/min_score": stats["min"],
-                "eval/max_score": stats["max"],
-            }
-            wandb.log(eval_metrics)
+        current_time = time.time()
+        if current_time - last_save_time >= 1800:
+            filename = save_checkpoint(agent, episode + 1, run_id, metrics)
+            wandb.save(filename)
+            last_save_time = current_time
 
-            if stats["mean"] > best_mean:
-                best_mean = stats["mean"]
-                plateau_counter = 0
-                # Save best model so far
-                agent.save("best_model.pth")
-                wandb.save("best_model.pth")
-            else:
-                plateau_counter += 1
-
-            if plateau_counter >= 3:
-                print("\nTraining has plateaued. Consider stopping.")
-
+        if (episode + 1) % (eval_freq * 2) == 0:
+            title = (
+                f"Training Progress (Episode {episode+1})\n"
+                f"Best: {metrics['best_eval_score']:.1f}"
+            )
             plot_training_progress(
-                all_rewards,
-                window=100,  # Shorter window
-                title=f"Training Progress (Episode {episode + 1})\n"
-                f"Best Eval Mean: {best_mean:.1f}",
+                metrics["episode_rewards"],
+                window=100,
+                title=title,
             )
 
     wandb.finish()
-    return agent, all_rewards, eval_stats
+
+
+def evaluate_episode(
+    agent: YahtzeeAgent, env: YahtzeeEnv, encoder: StateEncoder
+) -> float:
+    """Run a single evaluation episode."""
+    state = env.reset()
+    total_reward = 0
+    done = False
+
+    # Store original epsilon and set to minimum for deterministic evaluation
+    old_eps = agent.epsilon
+    agent.epsilon = 0.02
+
+    while not done:
+        state_vec = encoder.encode(state)
+        valid_actions = env.get_valid_actions()
+
+        if not valid_actions:
+            break
+
+        action_idx = agent.select_action(state_vec, valid_actions)
+        state, reward, done, _ = env.step(action_idx)
+        total_reward += reward
+
+    # Restore original epsilon
+    agent.epsilon = old_eps
+    return total_reward
 
 
 def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
-    """
-    Simulate a single game with visualization of dice and scoresheet.
-    Returns the final score.
-    """
+    """Simulate a single game with visualization."""
     env = YahtzeeEnv()
     encoder = StateEncoder()
     state = env.reset()
@@ -353,13 +544,9 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
     done = False
     turn = 1
 
-    # Store original temperature/epsilon
-    if agent.use_boltzmann:
-        old_temp = agent.temperature
-        agent.temperature = 0.01  # Nearly deterministic
-    else:
-        old_eps = agent.epsilon
-        agent.epsilon = 0.01
+    # Store original epsilon
+    old_eps = agent.epsilon
+    agent.epsilon = 0.01
 
     while not done:
         if render:
@@ -372,16 +559,8 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
         if not valid_actions:
             break
 
-        # Get Q-values for all actions
-        q_values = agent.get_q_values(state_vec)
-        # Mask invalid actions
-        mask = np.full(agent.action_size, float("-inf"))
-        mask[valid_actions] = 0
-        q_values = q_values + mask
-
-        # Select best action
-        action_idx = q_values.argmax()
-        action = env.IDX_TO_ACTION[action_idx]
+        action_idx = agent.select_action(state_vec, valid_actions)
+        action = IDX_TO_ACTION[action_idx]
 
         if render:
             print("\nAgent's decision:")
@@ -392,7 +571,6 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
                 print(f"Action: Hold dice at positions {held}")
             else:
                 print(f"Action: Score {action.data.name}")
-                print(f"Expected value: {q_values[action_idx]:.1f}")
 
         state, reward, done, _ = env.step(action_idx)
         total_reward += reward
@@ -401,7 +579,7 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
             if action.kind == ActionType.SCORE:
                 print(f"Scored {reward:.1f} points")
                 turn += 1
-            time.sleep(1)  # Pause to make it easier to follow
+            time.sleep(1)
 
     if render:
         clear_output(wait=True)
@@ -409,12 +587,8 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
         print(env.render())
         print(f"\nFinal Score: {total_reward:.1f}")
 
-    # Restore exploration parameters
-    if agent.use_boltzmann:
-        agent.temperature = old_temp
-    else:
-        agent.epsilon = old_eps
-
+    # Restore epsilon
+    agent.epsilon = old_eps
     return total_reward
 
 
@@ -467,87 +641,30 @@ def show_action_values(
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    """Main training function with command line interface."""
+    import argparse
 
-    # Train with more episodes and evaluation:
-    agent, rewards, eval_stats = train_yahtzee_agent(
-        num_episodes=50000,
-        use_boltzmann=True,
-        plot_interval=1000,
-        eval_interval=5000,
+    parser = argparse.ArgumentParser(description="Train Yahtzee agent")
+    parser.add_argument("--run_id", type=str, help="Run ID for resuming training")
+    parser.add_argument(
+        "--episodes", type=int, default=100000, help="Number of episodes"
     )
+    args = parser.parse_args()
 
-    # Final evaluation and save best model
-    print("\nFinal Evaluation:")
-    stats = evaluate_agent(agent, num_games=100)
-    print(f"\nFinal mean score: {stats['mean']:.1f}")
-    print(f"Final median score: {stats['median']:.1f}")
-
-    # Save model
-    if is_colab():
-        model_path = "/content/drive/MyDrive/yahtzee_dqn_improved.pth"
-    else:
-        model_path = "yahtzee_dqn_improved.pth"
-    agent.save(model_path)
-    print(f"Saved agent to {model_path}")
-    save_to_colab(model_path)
-
-    # Interactive mode
-    env = YahtzeeEnv()  # For calculation mode
-    current_state = None
-
-    while True:
-        print("\nChoose mode:")
-        print("1. Simulation Mode (watch agent play)")
-        print("2. Calculation Mode (see action values)")
-        print("3. Exit")
-
-        choice = input("\nEnter choice (1-3): ").strip()
-
-        if choice == "1":
-            print("\nSimulating a game...")
-            simulate_game(agent, render=True)
-        elif choice == "2":
-            print("\nStarting calculation mode...")
-            current_state, valid_actions = show_action_values(agent)
-
-            while True:
-                print("\nOptions:")
-                print("1. Take an action and continue")
-                print("2. Start new game")
-                print("3. Return to main menu")
-
-                subchoice = input("\nEnter choice (1-3): ").strip()
-
-                if subchoice == "1":
-                    try:
-                        prompt = "\nEnter action number: "
-                        action_num = int(input(prompt).strip())
-                        if 1 <= action_num <= len(valid_actions):
-                            action_idx = valid_actions[action_num - 1][0]
-                            next_state, reward, done, _ = env.step(action_idx)
-
-                            if done:
-                                msg = f"\nGame Over! Final Score: {reward:.1f}"
-                                print(msg)
-                                break
-                            else:
-                                # Get next state values
-                                result = show_action_values(agent, current_state)
-                                current_state, valid_actions = result
-                        else:
-                            print("\nInvalid action number!")
-                    except ValueError:
-                        print("\nPlease enter a valid number!")
-                elif subchoice == "2":
-                    current_state, valid_actions = show_action_values(agent)
-                else:
-                    break
+    # If run_id provided, try to find latest checkpoint
+    checkpoint_path = None
+    if args.run_id:
+        checkpoint_path = get_latest_checkpoint(args.run_id)
+        if checkpoint_path:
+            print(f"Found checkpoint: {checkpoint_path}")
         else:
-            break
+            print(f"No checkpoints found for run {args.run_id}")
 
-    print("\nThanks for playing!")
+    train(
+        run_id=args.run_id,
+        checkpoint_path=checkpoint_path,
+        num_episodes=args.episodes,
+    )
 
 
 if __name__ == "__main__":
