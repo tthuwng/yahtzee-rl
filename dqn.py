@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim import lr_scheduler
 
 Transition = namedtuple(
     "Transition", ("state", "action", "reward", "next_state", "done", "td_error")
@@ -14,20 +15,20 @@ Transition = namedtuple(
 
 
 class DQN(nn.Module):
-    """Deep Q-Network for Yahtzee with dueling architecture."""
+    """Optimized DQN for faster training."""
 
     def __init__(self, state_size: int, action_size: int) -> None:
         super().__init__()
 
-        # Feature extraction layers with residual connections
+        # Streamlined architecture with efficient layer sizes
         self.input_layer = nn.Sequential(
             nn.Linear(state_size, 256),
-            nn.ReLU(),
+            nn.ReLU(),  # Changed to ReLU for better stability
             nn.LayerNorm(256),
         )
 
-        # Residual blocks
-        self.res_block1 = nn.Sequential(
+        # Single efficient residual block
+        self.res_block = nn.Sequential(
             nn.Linear(256, 256),
             nn.ReLU(),
             nn.LayerNorm(256),
@@ -36,32 +37,16 @@ class DQN(nn.Module):
             nn.LayerNorm(256),
         )
 
-        self.res_block2 = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.LayerNorm(256),
-        )
-
-        self.output_layer = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.LayerNorm(128),
-        )
-
-        # Value stream for state value estimation
+        # Efficient value and advantage streams
         self.value_stream = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(256, 128),
             nn.ReLU(),
             nn.LayerNorm(128),
             nn.Linear(128, 1),
         )
 
-        # Advantage stream for action advantages
         self.advantage_stream = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(256, 128),
             nn.ReLU(),
             nn.LayerNorm(128),
             nn.Linear(128, action_size),
@@ -72,44 +57,40 @@ class DQN(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="relu")
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Forward pass with residual connections
+        # Efficient forward pass
         features = self.input_layer(x)
-
-        # First residual block
-        res1 = self.res_block1(features)
-        features = features + res1
-
-        # Second residual block
-        res2 = self.res_block2(features)
-        features = features + res2
-
-        # Output processing
-        features = self.output_layer(features)
+        
+        # Single residual connection
+        res = self.res_block(features)
+        features = features + res
 
         # Dueling streams
         values = self.value_stream(features)
         advantages = self.advantage_stream(features)
+        
+        # Combine streams
         qvalues = values + (advantages - advantages.mean(dim=1, keepdim=True))
         return qvalues
 
 
 class PrioritizedReplayBuffer:
-    """
-    A simple prioritized replay buffer.
-    """
+    """Optimized replay buffer for faster training."""
 
-    def __init__(self, capacity: int = 50000, alpha: float = 0.6) -> None:
+    def __init__(self, capacity: int = 50000, alpha: float = 0.6, beta: float = 0.4, device: str = "cuda") -> None:
         self.capacity = capacity
-        self.buffer: List[Transition] = []
-        self.priorities: List[float] = []
         self.alpha = alpha
+        self.beta = beta
+        self.beta_increment = 0.002  # Faster beta annealing
+        self.buffer: List[Transition] = []
+        self.device = torch.device(device)
+        self.priorities = torch.zeros(capacity, dtype=torch.float32, device=self.device)
         self.pos = 0
-        self.eps = 1e-3
+        self.eps = 1e-5
 
     def push(
         self,
@@ -122,48 +103,63 @@ class PrioritizedReplayBuffer:
     ) -> None:
         priority = (abs(td_error) + self.eps) ** self.alpha
         transition = Transition(state, action, reward, next_state, done, td_error)
+        
         if len(self.buffer) < self.capacity:
             self.buffer.append(transition)
-            self.priorities.append(priority)
+            self.priorities[len(self.buffer) - 1] = priority
         else:
             self.buffer[self.pos] = transition
             self.priorities[self.pos] = priority
+            
         self.pos = (self.pos + 1) % self.capacity
 
-    def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
-        if len(self.buffer) == 0:
-            raise ValueError("Cannot sample from empty buffer!")
-        priorities_np = np.array(self.priorities, dtype=np.float32)
-        prob = priorities_np / priorities_np.sum()
-        indices = np.random.choice(len(self.buffer), batch_size, p=prob)
-        batch = [self.buffer[idx] for idx in indices]
+    def sample(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, ...]:
+        n_samples = min(len(self.buffer), self.capacity)
+        
+        # Sample with priorities
+        probs = self.priorities[:n_samples] / self.priorities[:n_samples].sum()
+        indices = torch.multinomial(probs, batch_size, replacement=True)
+        
+        # Calculate importance sampling weights
+        weights = (n_samples * probs[indices]) ** (-self.beta)
+        weights = weights / weights.max()
+        self.beta = min(1.0, self.beta + self.beta_increment)
 
-        states = torch.FloatTensor([t.state for t in batch])
-        actions = torch.LongTensor([t.action for t in batch])
-        rewards = torch.FloatTensor([t.reward for t in batch])
-        next_states = torch.FloatTensor([t.next_state for t in batch])
-        dones = torch.FloatTensor([t.done for t in batch])
-        return (states, actions, rewards, next_states, dones, indices)
+        # Create batch from sampled indices
+        batch = [self.buffer[idx.item()] for idx in indices]
 
-    def update_priorities(self, indices: List[int], new_errors: np.ndarray) -> None:
-        for idx, err in zip(indices, new_errors):
-            self.priorities[idx] = (abs(err) + self.eps) ** self.alpha
+        # Convert numpy arrays to tensors and move to correct device
+        states = torch.from_numpy(np.stack([t.state for t in batch])).float().to(device)
+        actions = torch.tensor([t.action for t in batch], dtype=torch.long).to(device)
+        rewards = torch.tensor([t.reward for t in batch], dtype=torch.float).to(device)
+        next_states = torch.from_numpy(np.stack([t.next_state for t in batch])).float().to(device)
+        dones = torch.tensor([t.done for t in batch], dtype=torch.float).to(device)
+        weights = weights.to(device)
+
+        return states, actions, rewards, next_states, dones, weights, indices
+
+    def update_priorities(self, indices: torch.Tensor, new_errors: torch.Tensor) -> None:
+        # Move tensors to the same device as priorities
+        indices = indices.to(self.device)
+        new_errors = new_errors.to(self.device)
+        priorities = (new_errors.abs() + self.eps) ** self.alpha
+        self.priorities[indices] = priorities
 
     def __len__(self) -> int:
         return len(self.buffer)
 
 
 class YahtzeeAgent:
-    """DQN agent with epsilon-greedy exploration."""
+    """Optimized DQN agent for faster training."""
 
     def __init__(
         self,
         state_size: int,
         action_size: int,
-        batch_size: int = 256,
+        batch_size: int = 1024,
         gamma: float = 0.99,
         learning_rate: float = 2e-4,
-        target_update: int = 100,
+        target_update: int = 50,
         device: str = "cuda",
     ) -> None:
         self.state_size = state_size
@@ -175,63 +171,63 @@ class YahtzeeAgent:
         self.learn_steps = 0
         self.training_mode = True
 
-        # Networks
+        # Initialize networks
         self.policy_net = DQN(state_size, action_size).to(self.device)
         self.target_net = DQN(state_size, action_size).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
+        
+        for param in self.target_net.parameters():
+            param.requires_grad = False
 
-        # Exploration schedule
+        # Faster exploration decay
         self.epsilon = 1.0
         self.epsilon_min = 0.02
-        self.epsilon_decay = 0.9999  # Slower decay
+        self.epsilon_decay = 0.9995
 
-        # Use prioritized replay buffer instead of deque
-        self.buffer = PrioritizedReplayBuffer(capacity=100000, alpha=0.6)
+        # Smaller buffer for faster training with correct device
+        self.buffer = PrioritizedReplayBuffer(capacity=50000, device=device)
 
-        # Optimizer with AdamW
+        # Optimizer with higher learning rate
         self.optimizer = optim.AdamW(
             self.policy_net.parameters(),
             lr=learning_rate,
-            weight_decay=1e-5,
+            weight_decay=1e-4,
             amsgrad=True,
         )
 
-        # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=10000, T_mult=2, eta_min=1e-5
+        # Fixed scheduler using proper import
+        self.scheduler = lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=20000, eta_min=1e-5
         )
 
     def train(self) -> None:
+        """Set networks to training mode."""
         self.training_mode = True
         self.policy_net.train()
         self.target_net.train()
 
     def eval(self) -> None:
+        """Set networks to evaluation mode."""
         self.training_mode = False
         self.policy_net.eval()
         self.target_net.eval()
 
+    @torch.no_grad()
     def select_action(self, state_vec: np.ndarray, valid_actions: List[int]) -> int:
-        """Epsilon-greedy action selection."""
-        with torch.no_grad():
-            state_t = torch.FloatTensor(state_vec).to(self.device).unsqueeze(0)
-            q_values = self.policy_net(state_t).squeeze(0)
+        """Epsilon-greedy action selection with GPU acceleration."""
+        if self.training_mode and random.random() < self.epsilon:
+            return random.choice(valid_actions)
 
-            # Mask invalid actions
-            mask = torch.full((self.action_size,), float("-inf"), device=self.device)
-            mask[valid_actions] = 0
-            q_values = q_values + mask
+        # Convert state to tensor and move to correct device
+        state_t = torch.from_numpy(state_vec).float().to(self.device).unsqueeze(0)
+        q_values = self.policy_net(state_t).squeeze(0)
 
-            if self.training_mode and random.random() < self.epsilon:
-                # Bias towards scoring actions when exploring
-                score_actions = [
-                    a for a in valid_actions if a >= 33
-                ]  # Scoring actions start at index 33
-                if score_actions and random.random() < 0.3:  # 30% chance to force score
-                    return random.choice(score_actions)
-                return random.choice(valid_actions)
-            else:
-                return q_values.argmax().item()
+        # Mask invalid actions
+        mask = torch.full((self.action_size,), float("-inf"), device=self.device)
+        mask[valid_actions] = 0
+        q_values = q_values + mask
+
+        return q_values.argmax().item()
 
     def train_step(
         self,
@@ -241,22 +237,16 @@ class YahtzeeAgent:
         next_state: np.ndarray,
         done: bool,
     ) -> float:
-        # Store transition with default td_error of 1.0
+        # Store transition
         self.buffer.push(state, action, reward, next_state, done)
 
         if len(self.buffer) < self.batch_size:
             return 0.0
 
-        # Sample batch from prioritized replay buffer
-        states, actions, rewards, next_states, dones, indices = self.buffer.sample(
-            self.batch_size
+        # Sample batch with importance sampling
+        states, actions, rewards, next_states, dones, weights, indices = self.buffer.sample(
+            self.batch_size, self.device
         )
-
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        rewards = rewards.to(self.device)
-        next_states = next_states.to(self.device)
-        dones = dones.to(self.device)
 
         # Compute current Q values
         current_q = self.policy_net(states).gather(1, actions.unsqueeze(1))
@@ -265,21 +255,20 @@ class YahtzeeAgent:
         with torch.no_grad():
             next_actions = self.policy_net(next_states).argmax(dim=1, keepdim=True)
             next_q = self.target_net(next_states).gather(1, next_actions)
-            target_q = (
-                rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * self.gamma * next_q
-            )
+            target_q = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * self.gamma * next_q
 
-        # Compute loss with gradient clipping
-        loss = F.smooth_l1_loss(current_q, target_q)
+        # Compute loss with importance sampling
+        td_errors = (target_q - current_q).abs()
+        loss = (weights * F.smooth_l1_loss(current_q, target_q, reduction='none')).mean()
 
+        # Optimize
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
         self.optimizer.step()
 
-        # Update learning rate scheduler every 100 steps
-        if self.learn_steps % 100 == 0:
-            self.scheduler.step()
+        # Update priorities
+        self.buffer.update_priorities(indices, td_errors.detach().squeeze())
 
         # Soft update target network
         self.learn_steps += 1
@@ -292,82 +281,41 @@ class YahtzeeAgent:
                         0.005 * policy_param.data + 0.995 * target_param.data
                     )
 
-        # Decay epsilon
+        # Update learning rate and epsilon
+        self.scheduler.step()
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
-        # Update priorities based on new TD errors
-        with torch.no_grad():
-            td_errors = (target_q - current_q).abs().squeeze(1).cpu().numpy()
-        self.buffer.update_priorities(indices, td_errors)
 
         return loss.item()
 
+    @torch.no_grad()
     def get_q_values(self, state_vec: np.ndarray) -> np.ndarray:
-        with torch.no_grad():
-            state_t = torch.FloatTensor(state_vec).unsqueeze(0).to(self.device)
-            return self.policy_net(state_t).squeeze(0).cpu().numpy()
+        """Get Q-values for all actions in current state."""
+        state_t = torch.from_numpy(state_vec).float().to(self.device).unsqueeze(0)
+        return self.policy_net(state_t).squeeze(0).cpu().numpy()
 
     def save(self, path: str) -> None:
-        torch.save(self.policy_net.state_dict(), path)
+        """Save model with full training state."""
+        torch.save({
+            'policy_net': self.policy_net.state_dict(),
+            'target_net': self.target_net.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'epsilon': self.epsilon,
+        }, path)
 
     def load(self, path: str) -> None:
-        """Load model weights with backward compatibility."""
-        print(f"Loading model from: {path}")
-        try:
-            # Try loading with new architecture first
-            state_dict = torch.load(path, map_location=self.device)
-            if isinstance(state_dict, dict) and "policy_net" in state_dict:
-                # New checkpoint format
-                self.policy_net.load_state_dict(state_dict["policy_net"])
-                self.target_net.load_state_dict(state_dict["target_net"])
-                self.optimizer.load_state_dict(state_dict["optimizer"])
-                print("Successfully loaded checkpoint format")
-                return
-
-            # Try loading as direct state dict
-            try:
-                self.policy_net.load_state_dict(state_dict)
-                self.target_net.load_state_dict(state_dict)
-                print("Successfully loaded state dict format")
-                return
-            except:
-                pass
-
-            print("Converting legacy model format...")
-            # Convert legacy model with different dimensions
-            new_state = {}
-
-            # Helper function to resize tensors
-            def resize_tensor(tensor: torch.Tensor, new_shape: tuple) -> torch.Tensor:
-                if len(tensor.shape) == 1:  # For bias terms
-                    # For 1D tensors, we'll either truncate or pad with zeros
-                    result = torch.zeros(new_shape[0], device=tensor.device)
-                    min_size = min(tensor.shape[0], new_shape[0])
-                    result[:min_size] = tensor[:min_size]
-                    return result
-                elif len(tensor.shape) == 2:  # For weight matrices
-                    # For 2D tensors, we'll use interpolation
-                    tensor = tensor.float()  # Ensure float type for interpolation
-                    tensor = tensor.unsqueeze(0).unsqueeze(
-                        0
-                    )  # Add batch and channel dims
-                    resized = torch.nn.functional.interpolate(
-                        tensor, size=new_shape, mode="bilinear", align_corners=True
-                    )
-                    return resized.squeeze(0).squeeze(0)
-                return tensor
-
-            # Map legacy features to new architecture with resizing
-            for name, param in state_dict.items():
-                if name in self.policy_net.state_dict():
-                    target_shape = self.policy_net.state_dict()[name].shape
-                    new_state[name] = resize_tensor(param, target_shape)
-
-            # Load converted state dict
-            self.policy_net.load_state_dict(new_state)
-            self.target_net.load_state_dict(new_state)
-            print("Successfully loaded and converted legacy model format")
-
-        except Exception as e:
-            print(f"Error loading model: {str(e)}")
-            raise
+        """Load model with full training state."""
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        if isinstance(checkpoint, dict):
+            self.policy_net.load_state_dict(checkpoint['policy_net'])
+            self.target_net.load_state_dict(checkpoint['target_net'])
+            if 'optimizer' in checkpoint:
+                self.optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint:
+                self.scheduler.load_state_dict(checkpoint['scheduler'])
+            if 'epsilon' in checkpoint:
+                self.epsilon = checkpoint['epsilon']
+        else:
+            self.policy_net.load_state_dict(checkpoint)
+            self.target_net.load_state_dict(checkpoint)
