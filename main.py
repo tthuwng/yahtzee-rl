@@ -5,13 +5,10 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.cuda.amp as amp
 import wandb
 from IPython.display import clear_output
 from tqdm import tqdm
-import torch.cuda.amp as amp
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from dqn import YahtzeeAgent
 from encoder import StateEncoder
@@ -23,7 +20,6 @@ from env import (
     YahtzeeCategory,
     YahtzeeEnv,
 )
-from utils import plot_training_progress
 
 
 def evaluate_agent(agent: YahtzeeAgent, num_games: int = 100) -> dict:
@@ -74,108 +70,6 @@ def evaluate_agent(agent: YahtzeeAgent, num_games: int = 100) -> dict:
     return stats
 
 
-def quick_validation_training(
-    num_episodes: int = 5000,  # Reduced episodes for quick validation
-    batch_size: int = 1024,  # Larger batch size to improve GPU utilization
-    eval_games: int = 20,  # Fewer eval games
-    eval_interval: int = 500,  # More frequent evaluation
-) -> tuple:
-    """Quick training loop for validating the approach."""
-    # Generate unique run name with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"yahtzee_quick_val_{timestamp}"
-
-    env = YahtzeeEnv()
-    encoder = StateEncoder()
-
-    # Initialize agent with modified parameters
-    agent = YahtzeeAgent(
-        state_size=encoder.state_size,
-        action_size=NUM_ACTIONS,
-        batch_size=batch_size,
-        gamma=0.99,
-        learning_rate=2e-4,  # Slightly higher learning rate
-        target_update=250,  # More frequent target updates
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-
-    # Training metrics
-    all_rewards = []
-    best_mean = 0
-    eval_stats = []
-    best_model_path = None
-
-    # Create models directory if it doesn't exist
-    models_dir = "models"
-    if not os.path.exists(models_dir):
-        os.makedirs(models_dir)
-
-    # Training loop with progress bar
-    progress = tqdm(range(num_episodes), desc="Validation Training")
-    for episode in progress:
-        state = env.reset()
-        total_reward = 0.0
-        done = False
-
-        while not done:
-            state_vec = encoder.encode(state)
-            valid_actions = env.get_valid_actions()
-            if not valid_actions:
-                break
-
-            action_idx = agent.select_action(state_vec, valid_actions)
-            next_state, reward, done, _ = env.step(action_idx)
-            next_state_vec = encoder.encode(next_state)
-
-            # Train DQN
-            agent.train_step(
-                state_vec,
-                action_idx,
-                reward,
-                next_state_vec,
-                done,
-            )
-
-            total_reward += reward
-            state = next_state
-
-        all_rewards.append(total_reward)
-
-        # Update progress more frequently
-        if (episode + 1) % 50 == 0:
-            avg_score = np.mean(all_rewards[-50:])
-            progress.set_postfix({"Avg": f"{avg_score:.1f}"})
-
-        # Evaluate periodically
-        if (episode + 1) % eval_interval == 0:
-            print(f"\nQuick evaluation at episode {episode + 1}...")
-            stats = evaluate_agent(agent, num_games=eval_games)
-            eval_stats.append(stats)
-
-            if stats["mean"] > best_mean:
-                best_mean = stats["mean"]
-                # Save only the best model with score in filename
-                model_path = os.path.join(
-                    models_dir, f"{run_name}_score{int(stats['mean'])}.pth"
-                )
-                agent.save(model_path)
-                # Update best model path
-                if best_model_path and os.path.exists(best_model_path):
-                    os.remove(best_model_path)  # Remove old best model
-                best_model_path = model_path
-
-            plot_training_progress(
-                all_rewards,
-                window=50,
-                title=(
-                    f"Validation Progress (Episode {episode + 1})\n"
-                    f"Best Mean: {best_mean:.1f}"
-                ),
-            )
-
-    return agent, all_rewards, eval_stats
-
-
 def get_latest_checkpoint(run_id: str) -> Optional[str]:
     """Find the latest checkpoint for a given run ID."""
     models_dir = "models"
@@ -198,28 +92,32 @@ def calculate_strategic_reward(
     """Calculate strategic reward based on Yahtzee best practices."""
     base_reward = score  # Keep original score as base
     bonus_reward = 0.0
-    
+
     # Get current dice state for analysis
     dice = env.state.current_dice
     counts = np.bincount(dice)[1:] if any(dice) else []
     max_count = max(counts) if any(counts) else 0
     unique_vals = np.unique(dice[dice > 0]) if any(dice) else []
-    
+
     # Track upper section progress
     upper_cats = [
-        YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
-        YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
+        YahtzeeCategory.ONES,
+        YahtzeeCategory.TWOS,
+        YahtzeeCategory.THREES,
+        YahtzeeCategory.FOURS,
+        YahtzeeCategory.FIVES,
+        YahtzeeCategory.SIXES,
     ]
     upper_score = sum(env.state.score_sheet[cat] or 0 for cat in upper_cats)
     upper_remaining = sum(1 for cat in upper_cats if env.state.score_sheet[cat] is None)
-    
+
     # Early game strategy (first 6 turns)
     num_scored = sum(1 for score in env.state.score_sheet.values() if score is not None)
     is_early_game = num_scored < 6
-    
+
     # Add small baseline reward
     bonus_reward += 2.0  # Small baseline to avoid too many negatives
-    
+
     # Yahtzee opportunity rewards
     if max_count >= 4:
         if env.state.score_sheet[YahtzeeCategory.YAHTZEE] is None:
@@ -228,12 +126,12 @@ def calculate_strategic_reward(
             bonus_reward += 4.0  # Still good for other categories
     elif max_count == 3:
         bonus_reward += 3.0  # Good potential for Yahtzee or other high scores
-    
+
     # Upper section strategy
     if upper_remaining > 0:
         points_needed = max(0, 63 - upper_score)  # Points needed for bonus
         avg_needed = points_needed / upper_remaining if upper_remaining > 0 else 0
-        
+
         if category in upper_cats:
             val = upper_cats.index(category) + 1  # Value for this category (1-6)
             if score >= val * 3:  # Got 3 or more of the number
@@ -242,10 +140,10 @@ def calculate_strategic_reward(
                 bonus_reward += 3.0  # Good progress toward bonus
             elif score > 0:
                 bonus_reward += 1.0  # Any progress is good
-                
+
             # Extra reward for higher numbers in upper section
             bonus_reward += val * 0.2  # Small scaling bonus for higher numbers
-    
+
     # Straight opportunity rewards
     if len(unique_vals) >= 4:
         # Check for potential straights
@@ -256,7 +154,7 @@ def calculate_strategic_reward(
                 bonus_reward += 4.0
             elif env.state.score_sheet[YahtzeeCategory.SMALL_STRAIGHT] is None:
                 bonus_reward += 3.0
-    
+
     # Penalties for suboptimal plays
     if score == 0:  # Scoring zero
         if category == YahtzeeCategory.CHANCE:
@@ -270,7 +168,7 @@ def calculate_strategic_reward(
     else:
         # Small reward for any non-zero score
         bonus_reward += 1.0
-    
+
     # Achievement bonuses
     if category == YahtzeeCategory.YAHTZEE and score == 50:
         bonus_reward += 10.0  # Yahtzee is highest priority
@@ -284,14 +182,14 @@ def calculate_strategic_reward(
         bonus_reward += 3.0
     elif category == YahtzeeCategory.THREE_OF_A_KIND and score >= 20:
         bonus_reward += 2.0
-    
+
     # Late game adjustments
     if num_scored >= 10:  # Last few turns
         if category == YahtzeeCategory.CHANCE and score > 20:
             bonus_reward += 2.0  # Reward good Chance scores late
         elif score > 0:
             bonus_reward += 1.0  # Small bonus for any non-zero late game
-    
+
     # Keep rewards in reasonable range
     final_reward = base_reward + bonus_reward
     return max(final_reward, -10.0)  # Limit negative rewards
@@ -441,7 +339,7 @@ def train(
             # Run parallel episodes with automatic mixed precision
             episode_rewards = []
             episode_losses = []
-            
+
             for worker_id in range(num_workers):
                 state = worker_envs[worker_id].reset()
                 total_reward = 0
@@ -457,13 +355,17 @@ def train(
                     with amp.autocast():
                         action_idx = agent.select_action(state_vec, valid_actions)
                         action = worker_envs[worker_id].idx_to_action[action_idx]
-                        next_state, reward, done, _ = worker_envs[worker_id].step(action_idx)
+                        next_state, reward, done, _ = worker_envs[worker_id].step(
+                            action_idx
+                        )
 
                         if action.kind == ActionType.SCORE:
-                            reward = calculate_strategic_reward(worker_envs[worker_id], action.data, reward)
+                            reward = calculate_strategic_reward(
+                                worker_envs[worker_id], action.data, reward
+                            )
 
                         next_state_vec = worker_encoders[worker_id].encode(next_state)
-                        
+
                         # Scale loss for mixed precision training
                         with amp.autocast():
                             loss = agent.train_step(
@@ -494,7 +396,7 @@ def train(
 
             mean_reward = np.mean(episode_rewards)
             mean_loss = np.mean(episode_losses) if episode_losses else None
-            
+
             wandb.log(
                 {
                     "episode": episode,
@@ -536,7 +438,9 @@ def train(
 
                 mean_eval_score = np.mean(eval_rewards)
                 metrics["eval_scores"].append(mean_eval_score)
-                metrics["current_eval_score"] = mean_eval_score  # Update current eval score
+                metrics["current_eval_score"] = (
+                    mean_eval_score  # Update current eval score
+                )
 
                 wandb.log(
                     {
@@ -555,7 +459,9 @@ def train(
                 else:
                     metrics["patience_counter"] += 1
                     if metrics["patience_counter"] >= patience:
-                        print(f"\nEarly stopping after {patience} evaluations without improvement")
+                        print(
+                            f"\nEarly stopping after {patience} evaluations without improvement"
+                        )
                         break
 
                 agent.train()
@@ -571,7 +477,7 @@ def train(
         print("\nSaving final model...")
         final_metrics = {
             **metrics,
-            "final_mean_reward": np.mean(metrics["episode_rewards"][-100:])
+            "final_mean_reward": np.mean(metrics["episode_rewards"][-100:]),
         }
         filename = save_checkpoint(agent, episode + 1, run_id, final_metrics)
         wandb.save(filename)
@@ -587,14 +493,14 @@ def train(
             final_metrics = {
                 **metrics,
                 "final_mean_reward": np.mean(metrics["episode_rewards"][-100:]),
-                "interrupted": True
+                "interrupted": True,
             }
             filename = save_checkpoint(agent, episode + 1, run_id, final_metrics)
             wandb.save(filename)
             print(f"Final state saved to: {filename}")
         except Exception as e:
             print(f"Error saving final state: {str(e)}")
-        
+
         # Cleanup wandb
         if wandb.run is not None:
             wandb.finish()
@@ -740,8 +646,12 @@ def main():
     parser = argparse.ArgumentParser(description="Train Yahtzee agent")
     parser.add_argument("--run_id", type=str, help="Run ID for resuming training")
     parser.add_argument("--episodes", type=int, default=100, help="Number of episodes")
-    parser.add_argument("--checkpoint", type=str, help="Path to checkpoint to resume from")
-    parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers")
+    parser.add_argument(
+        "--checkpoint", type=str, help="Path to checkpoint to resume from"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=8, help="Number of parallel workers"
+    )
     args = parser.parse_args()
 
     # If run_id provided, try to find latest checkpoint

@@ -6,21 +6,23 @@ import numpy as np
 
 # Add these at the top of the file, after imports
 __all__ = [
-    'YahtzeeCategory',
-    'ActionType',
-    'Action',
-    'GameState',
-    'YahtzeeEnv',
-    'NUM_ACTIONS',
-    'IDX_TO_ACTION',
+    "YahtzeeCategory",
+    "ActionType",
+    "Action",
+    "GameState",
+    "YahtzeeEnv",
+    "NUM_ACTIONS",
+    "IDX_TO_ACTION",
 ]
 
 # Initialize constants at module level
 NUM_ACTIONS = 46  # 1 ROLL + 32 HOLD + 13 SCORE actions
 IDX_TO_ACTION = {}  # Will be populated by YahtzeeEnv
 
+
 class YahtzeeCategory(Enum):
     """Categories in Yahtzee."""
+
     ONES = auto()
     TWOS = auto()
     THREES = auto()
@@ -38,6 +40,7 @@ class YahtzeeCategory(Enum):
 
 class ActionType(Enum):
     """Types of actions in Yahtzee."""
+
     ROLL = auto()  # Roll all dice
     HOLD = auto()  # Hold some dice
     SCORE = auto()  # Score a category
@@ -46,6 +49,7 @@ class ActionType(Enum):
 @dataclass(frozen=True)
 class Action:
     """Action in Yahtzee game."""
+
     kind: ActionType
     data: Optional[object] = None  # bool array for HOLD, YahtzeeCategory for SCORE
 
@@ -59,6 +63,7 @@ class Action:
 @dataclass
 class GameState:
     """Current state of Yahtzee game."""
+
     current_dice: np.ndarray  # Values of 5 dice
     rolls_left: int  # Rolls remaining this turn
     score_sheet: Dict[YahtzeeCategory, Optional[int]]  # Category -> score or None
@@ -115,11 +120,11 @@ class YahtzeeEnv:
     def get_valid_actions(self) -> List[int]:
         """Get list of valid action indices."""
         valid = []
-        
-        # Can only roll or hold if:
-        # 1. Have rolls left
-        # 2. Not all categories are filled (game not over)
-        if self.state.rolls_left > 0 and None in self.state.score_sheet.values():
+
+        # Can only roll or hold if have rolls left and game not over
+        has_rolls = self.state.rolls_left > 0
+        not_finished = None in self.state.score_sheet.values()
+        if has_rolls and not_finished:
             # Can always roll all dice if not showing any dice
             if not np.any(self.state.current_dice):
                 valid.append(self.action_to_idx[Action(ActionType.ROLL)])
@@ -127,10 +132,9 @@ class YahtzeeEnv:
                 # Can roll or hold if showing dice
                 valid.append(self.action_to_idx[Action(ActionType.ROLL)])
                 for mask in self.hold_masks:
-                    # Only add hold actions that actually hold some dice
-                    if np.any(mask):
+                    if np.any(mask):  # Only add if actually holding dice
                         valid.append(self.action_to_idx[Action(ActionType.HOLD, mask)])
-        
+
         # Can score if:
         # 1. Category is not filled
         # 2. Have dice showing
@@ -138,16 +142,16 @@ class YahtzeeEnv:
             for cat in YahtzeeCategory:
                 if self.state.score_sheet[cat] is None:
                     valid.append(self.action_to_idx[Action(ActionType.SCORE, cat)])
-                
+
         return valid
 
     def calc_score(self, category: YahtzeeCategory, dice: np.ndarray) -> int:
         """Calculate score for category."""
         if not np.any(dice > 0):  # Can't score empty dice
             return 0
-            
+
         counts = np.bincount(dice, minlength=7)[1:]  # Skip index 0
-        
+
         if category == YahtzeeCategory.ONES:
             return counts[0] * 1
         elif category == YahtzeeCategory.TWOS:
@@ -177,19 +181,19 @@ class YahtzeeEnv:
             has_three = False
             has_two = False
             three_val = None
-            
+
             for val, count in enumerate(counts, 1):
                 if count == 3:
                     has_three = True
                     three_val = val
                 elif count == 2 and (not has_three or val != three_val):
                     has_two = True
-            
+
             return 25 if has_three and has_two else 0
         elif category == YahtzeeCategory.SMALL_STRAIGHT:
             # Check for sequences of 4 consecutive numbers
             sorted_unique = np.unique(dice)
-            for straight in [[1,2,3,4], [2,3,4,5], [3,4,5,6]]:
+            for straight in [[1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6]]:
                 if all(x in sorted_unique for x in straight):
                     return 30
             return 0
@@ -197,8 +201,8 @@ class YahtzeeEnv:
             # Check for sequences of 5 consecutive numbers
             sorted_unique = np.unique(dice)
             if len(sorted_unique) == 5 and (
-                all(x in sorted_unique for x in [1,2,3,4,5]) or
-                all(x in sorted_unique for x in [2,3,4,5,6])
+                all(x in sorted_unique for x in [1, 2, 3, 4, 5])
+                or all(x in sorted_unique for x in [2, 3, 4, 5, 6])
             ):
                 return 40
             return 0
@@ -229,7 +233,7 @@ class YahtzeeEnv:
         """Take action and return (next_state, reward, done, info)."""
         if action_idx not in self.idx_to_action:
             raise ValueError(f"Invalid action index: {action_idx}")
-            
+
         action = self.idx_to_action[action_idx]
         reward = 0.0
         done = False
@@ -240,7 +244,7 @@ class YahtzeeEnv:
                 raise ValueError("No rolls left!")
             self.roll_dice(np.zeros(5, dtype=bool))
             info["dice_rolled"] = True
-            
+
         elif action.kind == ActionType.HOLD:
             if self.state.rolls_left <= 0:
                 raise ValueError("No rolls left!")
@@ -248,7 +252,7 @@ class YahtzeeEnv:
                 raise ValueError("Cannot hold empty dice!")
             self.roll_dice(action.data)
             info["dice_held"] = np.where(action.data)[0].tolist()
-            
+
         elif action.kind == ActionType.SCORE:
             category = action.data
             if self.state.score_sheet[category] is not None:
@@ -262,15 +266,22 @@ class YahtzeeEnv:
             reward = float(points)
             info["category_scored"] = category.name
             info["points_scored"] = points
-            
+
             # Check if game is over (all categories filled)
             if all(score is not None for score in self.state.score_sheet.values()):
                 done = True
                 bonus = self.calc_upper_bonus()
                 reward += bonus
                 info["upper_bonus"] = bonus
-                info["final_score"] = sum(score for score in self.state.score_sheet.values() if score is not None) + bonus
-            
+                info["final_score"] = (
+                    sum(
+                        score
+                        for score in self.state.score_sheet.values()
+                        if score is not None
+                    )
+                    + bonus
+                )
+
             # Reset for next turn
             self.state.current_dice = np.zeros(5, dtype=int)
             self.state.rolls_left = 3
@@ -280,19 +291,22 @@ class YahtzeeEnv:
     def render(self) -> str:
         """Render game state as string."""
         lines = []
-        # Dice
-        dice_str = " ".join(str(d) if d > 0 else "-" for d in self.state.current_dice)
-        lines.append(f"Dice: [{dice_str}] (rolls left: {self.state.rolls_left})")
-        
+
+        # Format dice display
+        dice_vals = self.state.current_dice
+        dice_str = " ".join(str(d) if d > 0 else "-" for d in dice_vals)
+        rolls = self.state.rolls_left
+        lines.append(f"Dice: [{dice_str}] (rolls left: {rolls})")
+
         # Score sheet
         lines.append("\nScore sheet:")
         for cat in YahtzeeCategory:
             score = self.state.score_sheet[cat]
             lines.append(f"{cat.name}: {score if score is not None else '-'}")
-            
+
         # Upper section bonus
         bonus = self.calc_upper_bonus()
         if bonus > 0:
             lines.append(f"\nUpper Bonus: +{bonus}")
-            
+
         return "\n".join(lines)
