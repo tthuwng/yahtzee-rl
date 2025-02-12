@@ -189,7 +189,7 @@ class YahtzeeAgent:
         gamma: float = 0.97,  # lowered from 0.99
         learning_rate: float = 3e-4,
         target_update: int = 50,
-        device: str = "cuda",
+        device: str = "auto",  # Changed to auto by default
         min_epsilon: float = 0.02,
         epsilon_decay: float = 0.9995
     ) -> None:
@@ -198,7 +198,13 @@ class YahtzeeAgent:
         self.batch_size = batch_size
         self.gamma = gamma
         self.target_update = target_update
-        self.device = torch.device(device)
+        
+        # Handle device selection
+        if device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+            
         self.learn_steps = 0
         self.training_mode = True
         
@@ -220,7 +226,7 @@ class YahtzeeAgent:
             capacity=100000,  # Larger buffer for better sampling
             alpha=0.6,
             beta=0.4,
-            device=device
+            device=str(self.device)  # Convert device to string for buffer
         )
         
         # Optimizer with learning rate schedule
@@ -237,6 +243,9 @@ class YahtzeeAgent:
             T_max=20000,
             eta_min=1e-5
         )
+        
+        # Initialize mixed precision scaler if using CUDA
+        self.scaler = torch.cuda.amp.GradScaler() if self.device.type == "cuda" else None
         
     def train(self) -> None:
         """Set networks to training mode."""
@@ -307,8 +316,31 @@ class YahtzeeAgent:
             self.buffer.sample(self.batch_size, self.device)
         )
         
-        # Double Q-learning update with mixed precision
-        with torch.cuda.amp.autocast():
+        # Use mixed precision training if on CUDA, regular training on CPU
+        if self.device.type == "cuda":
+            with torch.cuda.amp.autocast():
+                # Current Q-values
+                current_q = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1))
+                
+                # Next Q-values with Double Q-learning
+                with torch.no_grad():
+                    next_actions = self.policy_net(next_states_t).argmax(dim=1, keepdim=True)
+                    next_q = self.target_net(next_states_t).gather(1, next_actions)
+                    target_q = rewards_t.unsqueeze(1) + (1 - dones_t.unsqueeze(1)) * self.gamma * next_q
+                
+                # Compute Huber loss with importance sampling
+                td_errors = (target_q - current_q).abs()
+                loss = (weights * F.smooth_l1_loss(current_q, target_q, reduction='none')).mean()
+                
+            # Optimize with scaler
+            self.optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # Regular training on CPU
             # Current Q-values
             current_q = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1))
             
@@ -321,12 +353,12 @@ class YahtzeeAgent:
             # Compute Huber loss with importance sampling
             td_errors = (target_q - current_q).abs()
             loss = (weights * F.smooth_l1_loss(current_q, target_q, reduction='none')).mean()
-        
-        # Optimize
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
-        self.optimizer.step()
+            
+            # Regular optimization
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
+            self.optimizer.step()
         
         # Update priorities
         self.buffer.update_priorities(indices, td_errors.detach().squeeze())
@@ -375,7 +407,13 @@ class YahtzeeAgent:
             self.policy_net.load_state_dict(checkpoint["policy_net"])
             self.target_net.load_state_dict(checkpoint["target_net"])
             if "optimizer" in checkpoint:
-                self.optimizer.load_state_dict(checkpoint["optimizer"])
+                # Load optimizer state with proper device mapping
+                optimizer_state = checkpoint["optimizer"]
+                for state in optimizer_state["state"].values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(self.device)
+                self.optimizer.load_state_dict(optimizer_state)
             if "scheduler" in checkpoint:
                 self.scheduler.load_state_dict(checkpoint["scheduler"])
             if "epsilon" in checkpoint:
