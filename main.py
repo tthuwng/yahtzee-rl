@@ -499,7 +499,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train Yahtzee DQN agent")
     parser.add_argument("--run_id", type=str, help="Run ID for resuming training")
     parser.add_argument(
-        "--episodes", type=int, default=100000, help="Number of episodes"
+        "--episodes", type=int, default=50000, help="Number of episodes"
     )
     parser.add_argument(
         "--checkpoint", type=str, help="Path to checkpoint to resume from"
