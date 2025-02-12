@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Add these at the top of the file, after imports
 __all__ = [
     "YahtzeeCategory",
     "ActionType",
@@ -254,14 +253,14 @@ class YahtzeeEnv:
         # small baseline to reward any play
         bonus_reward += 2.0
 
-        # encourage big combos
+        # encourage big combos (increased from previous values)
         if (
             max_count >= 4
             and self.state.score_sheet.get(YahtzeeCategory.YAHTZEE) is None
         ):
-            bonus_reward += 8.0
+            bonus_reward += 10.0  # was 8
         elif max_count >= 3:
-            bonus_reward += 3.0
+            bonus_reward += 4.0  # was 3
 
         # partial reward for going after the upper bonus
         if category in upper_cats:
@@ -282,20 +281,20 @@ class YahtzeeEnv:
 
         # reward full house, straights
         if category == YahtzeeCategory.FULL_HOUSE and base_score == 25:
-            bonus_reward += 4.0
+            bonus_reward += 5.0  # was 4
         elif category == YahtzeeCategory.SMALL_STRAIGHT and base_score == 30:
-            bonus_reward += 5.0
+            bonus_reward += 6.0  # was 5
         elif category == YahtzeeCategory.LARGE_STRAIGHT and base_score == 40:
-            bonus_reward += 6.0
+            bonus_reward += 8.0  # was 6
         elif category == YahtzeeCategory.YAHTZEE and base_score == 50:
-            bonus_reward += 10.0
+            bonus_reward += 15.0  # was 10
 
         # penalize zeroing out potentially valuable categories
         if base_score == 0:
             if category == YahtzeeCategory.CHANCE:
-                bonus_reward -= 10.0
+                bonus_reward -= 12.0  # was 10
             else:
-                bonus_reward -= 4.0
+                bonus_reward -= 6.0   # was 4
 
         # final combined reward
         return base_score + bonus_reward
