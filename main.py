@@ -18,12 +18,8 @@ from dqn import YahtzeeAgent
 def evaluate_agent(
     agent: YahtzeeAgent, num_games: int = 100, objective: str = "win"
 ) -> dict:
-    """
-    Evaluate agent performance across multiple games.
-    Returns statistics for both training rewards and actual game scores.
-    """
     env = YahtzeeEnv(
-        reward_strategy=RewardStrategy.STRATEGIC
+        reward_strategy=RewardStrategy.POTENTIAL
         if objective == "win"
         else RewardStrategy.STANDARD
     )
@@ -53,7 +49,6 @@ def evaluate_agent(
 
         training_rewards.append(total_reward)
 
-        # Calculate actual game score
         upper_total = sum(
             state.score_sheet[cat] or 0
             for cat in [
@@ -124,7 +119,6 @@ def evaluate_agent(
 
 
 def get_latest_checkpoint(run_id: str) -> Optional[str]:
-    """Find the latest checkpoint for a given run ID."""
     models_dir = "models"
     checkpoints = [
         f
@@ -141,7 +135,6 @@ def get_latest_checkpoint(run_id: str) -> Optional[str]:
 def load_checkpoint(
     checkpoint_path: str, agent: YahtzeeAgent, device: torch.device
 ) -> int:
-    """Load checkpoint and return starting episode."""
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
@@ -170,7 +163,6 @@ def save_checkpoint(
     metrics: dict,
     is_best: bool = False,
 ) -> str:
-    """Save checkpoint with consistent format and metrics."""
     models_dir = "models"
     if not os.path.exists(models_dir):
         os.makedirs(models_dir)
@@ -200,7 +192,7 @@ def train(
     run_id: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
     num_episodes: int = 100000,
-    num_envs: int = 32,
+    num_envs: int = 64,
     steps_per_update: int = 8,
     checkpoint_freq: int = 100,
     eval_freq: int = 50,
@@ -208,10 +200,6 @@ def train(
     min_improvement: float = 1.0,
     objective: str = "win",
 ) -> None:
-    """
-    Train the DQN agent using parallel YahtzeeEnv environments.
-    We'll encode states using StateEncoder and follow a Gym-like approach.
-    """
     if run_id is None:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -233,11 +221,11 @@ def train(
         resume=checkpoint_path is not None,
     )
 
+    # Switch to potential-based if objective == "win"
     reward_strat = (
-        RewardStrategy.STRATEGIC if objective == "win" else RewardStrategy.STANDARD
+        RewardStrategy.POTENTIAL if objective == "win" else RewardStrategy.STANDARD
     )
 
-    # Create parallel environments and encoders
     envs = [YahtzeeEnv(reward_strategy=reward_strat) for _ in range(num_envs)]
     encoders = [
         StateEncoder(use_opponent_value=(objective == "win")) for _ in range(num_envs)
@@ -250,11 +238,12 @@ def train(
         action_size=NUM_ACTIONS,
         batch_size=1024,
         gamma=0.99,
-        learning_rate=3e-4,
+        learning_rate=2e-4,
         target_update=50,
         device=device,
         min_epsilon=0.02,
-        epsilon_decay=0.9997,
+        epsilon_decay=0.9992,
+        n_step=3,
     )
 
     start_episode = 0
@@ -279,7 +268,6 @@ def train(
             episode_losses = []
             actual_scores = []
 
-            # Reset all environments
             states = [env.reset() for env in envs]
             dones = [False] * num_envs
             total_rewards = [0.0] * num_envs
@@ -289,7 +277,6 @@ def train(
                 if not active_indices:
                     break
 
-                # Encode states
                 state_vecs = np.stack(
                     [
                         encoders[i].encode(
@@ -298,62 +285,42 @@ def train(
                         for i in active_indices
                     ]
                 )
-                # Collect valid actions
                 valid_actions_list = [
                     envs[i].get_valid_actions() for i in active_indices
                 ]
-
-                # If any environment has no valid actions, skip
                 if not all(valid_actions_list):
                     continue
 
-                # Agent picks actions
                 actions = agent.select_actions_batch(state_vecs, valid_actions_list)
 
-                # Step environments
                 next_states = []
-                rewards = []
+                rewards_ = []
                 new_dones = []
-
                 for idx, action in zip(active_indices, actions):
-                    next_state, reward, done, info = envs[idx].step(action)
-                    next_states.append(next_state)
-                    rewards.append(reward)
-                    new_dones.append(done)
-                    total_rewards[idx] += reward
-                    states[idx] = next_state
-                    dones[idx] = done
-
-                    if done and "final_score" in info:
+                    ns, rew, dn, info = envs[idx].step(action)
+                    next_states.append(ns)
+                    rewards_.append(rew)
+                    new_dones.append(dn)
+                    total_rewards[idx] += rew
+                    states[idx] = ns
+                    dones[idx] = dn
+                    if dn and "final_score" in info:
                         actual_scores.append(info["final_score"])
 
-                # Now encode next_states for training
-                if next_states:
-                    next_state_vecs = np.stack(
-                        [
-                            encoders[i].encode(
-                                ns, opponent_value=0.5 if objective == "win" else 0.0
-                            )
-                            for i, ns in zip(active_indices, next_states)
-                        ]
-                    )
-                    loss = agent.train_step_batch(
-                        state_vecs,
-                        actions,
-                        rewards,
-                        next_state_vecs,
-                        new_dones,
-                    )
-                    if loss is not None:
-                        episode_losses.append(loss)
+                agent.train_step_batch(
+                    [states[a] for a in active_indices],
+                    actions,
+                    rewards_,
+                    [next_states[i] for i in range(len(active_indices))],
+                    new_dones,
+                    env_indices=active_indices
+                )
 
             episode_rewards.extend(total_rewards)
             metrics["episode_rewards"].extend(episode_rewards)
-            if episode_losses:
-                metrics["losses"].extend(episode_losses)
 
             mean_reward = np.mean(episode_rewards)
-            mean_loss = np.mean(episode_losses) if episode_losses else None
+            mean_loss = 0.0
             mean_actual_score = np.mean(actual_scores) if actual_scores else None
 
             wandb.log(
@@ -378,7 +345,6 @@ def train(
                     }
                 )
 
-            # Periodic evaluation
             if (episode + 1) % eval_freq == 0:
                 eval_stats = evaluate_agent(agent, num_eval_episodes, objective)
                 mean_eval_score = eval_stats["actual_score"]["mean"]
@@ -405,7 +371,7 @@ def train(
                     )
 
             current_time = time.time()
-            if current_time - last_save_time >= 1800:  # Save every 30 minutes
+            if current_time - last_save_time >= 1800:
                 filename = save_checkpoint(agent, episode + 1, run_id, metrics)
                 last_save_time = current_time
 
@@ -435,7 +401,6 @@ def train(
 def evaluate_episode(
     agent: YahtzeeAgent, env: YahtzeeEnv, encoder: StateEncoder
 ) -> float:
-    """Run a single evaluation episode."""
     state = env.reset()
     total_reward = 0
     done = False
@@ -458,7 +423,6 @@ def evaluate_episode(
 
 
 def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
-    """Simulate a single game with visualization."""
     env = YahtzeeEnv()
     encoder = StateEncoder()
     state = env.reset()
@@ -570,11 +534,6 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
 def show_action_values(
     agent: YahtzeeAgent, state: Optional[GameState] = None, num_top: int = 5
 ) -> tuple:
-    """
-    Show expected values for all valid actions in the current state.
-    If state is None, starts a new game.
-    Returns (state, valid_actions[:num_top]) for further use.
-    """
     env = YahtzeeEnv()
     encoder = StateEncoder()
 
@@ -597,7 +556,7 @@ def show_action_values(
 
     print("\nTop Actions and Their Expected Values:")
     for i, (action_idx, value) in enumerate(valid_q[:num_top], 1):
-        action = env.IDX_TO_ACTION[action_idx]
+        action = IDX_TO_ACTION[action_idx]
         if action.kind == ActionType.ROLL:
             print(f"{i}. ROLL all dice (EV: {value:.1f})")
         elif action.kind == ActionType.HOLD:
@@ -616,7 +575,6 @@ def show_action_values(
 
 
 def main():
-    """Command-line interface to train or resume a run."""
     import argparse
 
     parser = argparse.ArgumentParser(description="Train Yahtzee DQN agent (Gym-based)")
@@ -628,12 +586,12 @@ def main():
         "--checkpoint", type=str, help="Path to checkpoint to resume from"
     )
     parser.add_argument(
-        "--num_envs", type=int, default=32, help="Number of parallel environments"
+        "--num_envs", type=int, default=64, help="Number of parallel environments"
     )
     parser.add_argument(
         "--objective",
         type=str,
-        default="win",
+        default="avg_score",  # changed default
         choices=["win", "avg_score"],
         help="Training objective (win or avg_score)",
     )
@@ -646,7 +604,3 @@ def main():
         num_envs=args.num_envs,
         objective=args.objective,
     )
-
-
-if __name__ == "__main__":
-    main()
