@@ -54,10 +54,19 @@ class Action:
     data: Optional[object] = None  # bool array for HOLD, YahtzeeCategory for SCORE
 
     def __hash__(self):
-        if self.kind == ActionType.HOLD and self.data is not None:
+        if self.kind == ActionType.HOLD and isinstance(self.data, np.ndarray):
             # Convert numpy array to tuple for hashing
-            return hash((self.kind, tuple(self.data)))
+            return hash((self.kind, tuple(self.data.tolist())))
         return hash((self.kind, self.data))
+
+    def __eq__(self, other):
+        if not isinstance(other, Action):
+            return False
+        if self.kind != other.kind:
+            return False
+        if isinstance(self.data, np.ndarray) and isinstance(other.data, np.ndarray):
+            return np.array_equal(self.data, other.data)
+        return self.data == other.data
 
 
 @dataclass

@@ -124,15 +124,15 @@ class PrioritizedReplayBuffer:
 
     def __init__(
         self,
-        capacity: int = 200000,
-        alpha: float = 0.6,
-        beta: float = 0.4,
+        capacity: int = 1_000_000,
+        alpha: float = 0.7,
+        beta: float = 0.5,
         device: str = "cuda",
     ) -> None:
         self.capacity = capacity
         self.alpha = alpha
         self.beta = beta
-        self.beta_increment = 0.001
+        self.beta_increment = 0.00001
         self.buffer = []
         self.device = torch.device(device)
         self.priorities = torch.zeros(capacity, dtype=torch.float32, device=self.device)
@@ -265,10 +265,15 @@ class YahtzeeAgent:
             param.requires_grad = False
 
         # Replay buffer
-        self.buffer = PrioritizedReplayBuffer(capacity=200000, alpha=0.6, beta=0.4, device=device)
+        self.buffer = PrioritizedReplayBuffer(
+            capacity=1_000_000,
+            alpha=0.7,
+            beta=0.5,
+            device=device
+        )
 
+        # Simple Adam (no scheduler)
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=200000, eta_min=1e-5)
 
         # N-step for each environment
         self.n_step = n_step
@@ -341,9 +346,9 @@ class YahtzeeAgent:
         for i, done_flag, ns in zip(env_indices, dones, next_states):
             if done_flag or self.nstep_buffers[i].is_full():
                 self._store_nstep_transition(i, ns, done_flag)
-                self.nstep_buffers[i].pop()  # remove first from queue if we stored
+                self.nstep_buffers[i].pop()
 
-            # If done, flush all the leftover transitions
+            # If done, flush all leftover transitions
             if done_flag:
                 while self.nstep_buffers[i].queue:
                     self._store_nstep_transition(i, ns, True)
@@ -372,7 +377,7 @@ class YahtzeeAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 5.0)
         self.optimizer.step()
 
         # Update priorities
@@ -385,8 +390,7 @@ class YahtzeeAgent:
                 for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
                     target_param.data.copy_(0.005 * policy_param.data + 0.995 * target_param.data)
 
-        # Update LR and epsilon
-        self.scheduler.step()
+        # Update epsilon
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
         return loss.item()
@@ -403,7 +407,6 @@ class YahtzeeAgent:
                 "policy_net": self.policy_net.state_dict(),
                 "target_net": self.target_net.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
-                "scheduler": self.scheduler.state_dict(),
                 "epsilon": self.epsilon,
             },
             path,
@@ -416,8 +419,6 @@ class YahtzeeAgent:
             self.target_net.load_state_dict(checkpoint["target_net"])
             if "optimizer" in checkpoint:
                 self.optimizer.load_state_dict(checkpoint["optimizer"])
-            if "scheduler" in checkpoint:
-                self.scheduler.load_state_dict(checkpoint["scheduler"])
             if "epsilon" in checkpoint:
                 self.epsilon = checkpoint["epsilon"]
         else:
@@ -484,7 +485,7 @@ class YahtzeeAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 5.0)
         self.optimizer.step()
 
         self.buffer.update_priorities(indices, td_errors.detach().squeeze())
@@ -495,6 +496,5 @@ class YahtzeeAgent:
                 for tparam, pparam in zip(self.target_net.parameters(), self.policy_net.parameters()):
                     tparam.data.copy_(0.005 * pparam.data + 0.995 * tparam.data)
 
-        self.scheduler.step()
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
         return loss.item()

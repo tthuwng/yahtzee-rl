@@ -1,21 +1,21 @@
 import gradio as gr
-import torch
 import numpy as np
+import torch
 
-from env import YahtzeeEnv, IDX_TO_ACTION
-from encoder import StateEncoder
 from dqn import YahtzeeAgent
+from encoder import StateEncoder
+from env import IDX_TO_ACTION, YahtzeeEnv
 
 # We'll load a saved checkpoint of the agent
 # Provide a path or load from default
-AGENT_PATH = "models/yahtzee_run_best.pth"
+AGENT_PATH = "models/yahtzee_run_20250211_041138_checkpoint_20000.pth"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 agent = YahtzeeAgent(
     state_size=22,  # default if not using opponent_value
     action_size=46,
     device=device,
-    num_envs=1
+    num_envs=1,
 )
 try:
     agent.load(AGENT_PATH)
@@ -26,6 +26,7 @@ except:
 # Prepare environment and encoder for demonstration
 demo_env = YahtzeeEnv()
 demo_encoder = StateEncoder(use_opponent_value=False)
+
 
 def simulate_game_interface():
     """
@@ -57,6 +58,7 @@ def simulate_game_interface():
     agent.train()
     return "\n".join(text_log)
 
+
 def calculate_q_values(dice_str, rolls_left, score_dict_str):
     """
     Let user specify dice, rolls_left, and partial score sheet to see Q-values for each action.
@@ -72,7 +74,7 @@ def calculate_q_values(dice_str, rolls_left, score_dict_str):
             return "Please provide exactly 5 dice values."
     except:
         return "Failed parsing dice. Make sure it's comma-separated 5 integers."
-    
+
     # parse score dict
     score_sheet = {}
     try:
@@ -80,7 +82,8 @@ def calculate_q_values(dice_str, rolls_left, score_dict_str):
         #           THREE_OF_A_KIND=None, FOUR_OF_A_KIND=None, FULL_HOUSE=None,
         #           SMALL_STRAIGHT=None, LARGE_STRAIGHT=None, YAHTZEE=None, CHANCE=None"
         from env import YahtzeeCategory
-        mapping = {cat.name:cat for cat in YahtzeeCategory}
+
+        mapping = {cat.name: cat for cat in YahtzeeCategory}
         entries = [x.strip() for x in score_dict_str.split(",")]
         for e in entries:
             if "=" in e:
@@ -99,10 +102,11 @@ def calculate_q_values(dice_str, rolls_left, score_dict_str):
         return f"Error parsing score dict: {e}"
 
     from env import GameState
+
     state = GameState(
         current_dice=np.array(dice_vals, dtype=int),
         rolls_left=int(rolls_left),
-        score_sheet=score_sheet
+        score_sheet=score_sheet,
     )
     vec = demo_encoder.encode(state)
     valid_actions = demo_env.get_valid_actions()
@@ -120,21 +124,30 @@ def calculate_q_values(dice_str, rolls_left, score_dict_str):
     mask[valid_indices] = 0
     q_values += mask
     # Sort
-    ranked = sorted([(i, float(q_values[i])) for i in valid_indices], key=lambda x: x[1], reverse=True)
+    ranked = sorted(
+        [(i, float(q_values[i])) for i in valid_indices],
+        key=lambda x: x[1],
+        reverse=True,
+    )
     lines = []
     for rank, (idx, val) in enumerate(ranked):
         action = IDX_TO_ACTION[idx]
-        lines.append(f"{rank+1}. {action.kind.name} {action.data if action.data else ''} => Q={val:.2f}")
+        lines.append(
+            f"{rank + 1}. {action.kind.name} {action.data if action.data else ''} => Q={val:.2f}"
+        )
     return "\n".join(lines)
 
+
 with gr.Blocks() as demo:
-    gr.Markdown("# Yahtzee RL Demo\nWelcome to Yahtzee agent UI. We have two modes below.")
-    
+    gr.Markdown(
+        "# Yahtzee RL Demo\nWelcome to Yahtzee agent UI. We have two modes below."
+    )
+
     with gr.Tab("Simulation Mode"):
         sim_btn = gr.Button("Run a full game with the RL Agent")
         sim_output = gr.Textbox(lines=25, label="Game Progress & Final Score")
         sim_btn.click(fn=simulate_game_interface, outputs=sim_output)
-    
+
     with gr.Tab("Calculation Mode"):
         gr.Markdown("Provide partial game state to see Q-values.")
         dice_in = gr.Textbox(label="Dice (comma-separated, e.g. '1,2,3,4,0')")
@@ -142,6 +155,10 @@ with gr.Blocks() as demo:
         score_in = gr.Textbox(label="Score Sheet (e.g. 'ONES=None, TWOS=None, ...')")
         calc_btn = gr.Button("Get Q-Values")
         calc_out = gr.Textbox(lines=15, label="Valid Actions & Q-Values")
-        calc_btn.click(fn=calculate_q_values, inputs=[dice_in, rolls_in, score_in], outputs=calc_out)
+        calc_btn.click(
+            fn=calculate_q_values,
+            inputs=[dice_in, rolls_in, score_in],
+            outputs=calc_out,
+        )
 
 demo.launch()

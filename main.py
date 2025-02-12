@@ -92,15 +92,17 @@ def get_latest_checkpoint(run_id: str) -> Optional[str]:
 def calculate_strategic_reward(
     env: YahtzeeEnv, category: YahtzeeCategory, score: float
 ) -> float:
+    """
+    Extra shaping to encourage high-value categories, upper bonus, etc.
+    Adjust as needed for better policies.
+    """
     base_reward = score
-    bonus_reward = 2.0  # Baseline reward
+    bonus_reward = 2.0
 
     dice = env.state.current_dice
-    # Ensure counts is a NumPy array even if dice has no non-zero values
-    counts = np.bincount(dice, minlength=7)[1:] if np.any(dice) else np.array([])
+    counts = np.bincount(dice, minlength=7)[1:] if np.any(dice) else np.array([0] * 6)
     max_count = int(max(counts)) if counts.size > 0 else 0
-    # Ensure unique_vals is a NumPy array as well
-    unique_vals = np.unique(dice[dice > 0]) if np.any(dice) else np.array([])
+    unique_vals = np.unique(dice) if np.any(dice) else np.array([])
 
     upper_cats = [
         YahtzeeCategory.ONES,
@@ -115,48 +117,38 @@ def calculate_strategic_reward(
     num_scored = sum(1 for s in env.state.score_sheet.values() if s is not None)
     is_early_game = num_scored < 6
 
+    # Encourage high-of-a-kind & Yahtzees
     if max_count >= 4:
-        if env.state.score_sheet[YahtzeeCategory.YAHTZEE] is None:
-            bonus_reward += 8.0
-        else:
-            bonus_reward += 4.0
+        bonus_reward += 5.0
     elif max_count == 3:
-        bonus_reward += 3.0
+        bonus_reward += 2.0
 
+    # Encourage upper bonus
     if upper_remaining > 0:
         points_needed = max(0, 63 - upper_score)
         avg_needed = points_needed / upper_remaining if upper_remaining > 0 else 0
         if category in upper_cats:
             val = upper_cats.index(category) + 1
             if score >= val * 3:
-                bonus_reward += 7.0
+                bonus_reward += 8.0
             elif score >= avg_needed:
-                bonus_reward += 5.0
+                bonus_reward += 3.0
             elif score > 0:
-                bonus_reward += 2.0
-            bonus_reward += val * 0.3
+                bonus_reward += 1.0
+            bonus_reward += val * 0.2
 
-    if unique_vals.size >= 4:
+    # Straights
+    if len(unique_vals) >= 4:
         sorted_vals = np.sort(unique_vals)
         gaps = np.diff(sorted_vals)
         if np.all(gaps == 1):
-            if env.state.score_sheet[YahtzeeCategory.LARGE_STRAIGHT] is None:
-                bonus_reward += 10.0
-            elif env.state.score_sheet[YahtzeeCategory.SMALL_STRAIGHT] is None:
-                bonus_reward += 7.0
+            bonus_reward += 5.0
 
+    # If we got 0 points
     if score == 0:
-        if category == YahtzeeCategory.CHANCE:
-            bonus_reward -= 10.0
-        elif max_count >= 3:
-            bonus_reward -= 8.0
-        elif unique_vals.size >= 4:
-            bonus_reward -= 6.0
-        elif is_early_game and category in upper_cats:
-            bonus_reward -= 4.0
-    else:
-        bonus_reward += 1.0
+        bonus_reward -= 5.0
 
+    # Big combos
     if category == YahtzeeCategory.YAHTZEE and score == 50:
         bonus_reward += 15.0
     elif category == YahtzeeCategory.LARGE_STRAIGHT and score == 40:
@@ -165,19 +157,13 @@ def calculate_strategic_reward(
         bonus_reward += 7.0
     elif category == YahtzeeCategory.FULL_HOUSE and score == 25:
         bonus_reward += 5.0
-    elif category == YahtzeeCategory.FOUR_OF_A_KIND and score >= 20:
-        bonus_reward += 4.0
-    elif category == YahtzeeCategory.THREE_OF_A_KIND and score >= 20:
-        bonus_reward += 3.0
 
-    if num_scored >= 10:
-        if category == YahtzeeCategory.CHANCE and score > 20:
-            bonus_reward += 2.0
-        elif score > 0:
-            bonus_reward += 1.0
+    # Late game slight bonus
+    if num_scored >= 10 and score > 0:
+        bonus_reward += 2.0
 
     final_reward = base_reward + bonus_reward
-    return max(final_reward, -10.0)
+    return final_reward
 
 
 def load_checkpoint(
@@ -222,7 +208,6 @@ def save_checkpoint(
         "policy_net": agent.policy_net.state_dict(),
         "target_net": agent.target_net.state_dict(),
         "optimizer": agent.optimizer.state_dict(),
-        "scheduler": agent.scheduler.state_dict(),
         "metrics": metrics,
         "epsilon": agent.epsilon,
     }
@@ -283,13 +268,13 @@ def train(
     agent = YahtzeeAgent(
         state_size=encoders[0].state_size,
         action_size=NUM_ACTIONS,
-        batch_size=2048,
-        gamma=0.99,
-        learning_rate=1e-3,
-        target_update=50,
+        batch_size=4096,
+        gamma=0.999,
+        learning_rate=2.5e-4,
+        target_update=500,
         device=device,
         min_epsilon=0.02,
-        epsilon_decay=0.9998,
+        epsilon_decay=0.9995,
     )
 
     start_episode = 0
@@ -333,7 +318,7 @@ def train(
                         encoders[i].encode(
                             s, opponent_value=0.5 if objective == "win" else 0.0
                         )
-                        for i, s in enumerate(active_states)
+                        for i, s in zip(active_indices, active_states)
                     ]
                 )
                 valid_actions_list = [
@@ -355,11 +340,12 @@ def train(
                         and "category_scored" in info
                         and "points_scored" in info
                     ):
-                        reward = calculate_strategic_reward(
+                        shaped = calculate_strategic_reward(
                             envs[idx],
                             YahtzeeCategory[info["category_scored"]],
                             info["points_scored"],
                         )
+                        reward = shaped
 
                     next_states.append(next_state)
                     rewards.append(reward)
@@ -374,7 +360,7 @@ def train(
                             encoders[i].encode(
                                 s, opponent_value=0.5 if objective == "win" else 0.0
                             )
-                            for i, s in enumerate(next_states)
+                            for i, s in zip(active_indices, next_states)
                         ]
                     )
                     loss = agent.train_step_batch(
@@ -438,6 +424,7 @@ def train(
                     print(f"\nNew best eval score: {mean_eval_score:.1f}")
 
             current_time = time.time()
+            # Periodically checkpoint regardless of eval improvements
             if current_time - last_save_time >= 1800:
                 filename = save_checkpoint(agent, episode + 1, run_id, metrics)
                 wandb.save(filename)
@@ -453,7 +440,9 @@ def train(
             print("\nSaving final model...")
             final_metrics = {
                 **metrics,
-                "final_mean_reward": np.mean(metrics["episode_rewards"][-100:]),
+                "final_mean_reward": np.mean(metrics["episode_rewards"][-100:])
+                if metrics["episode_rewards"]
+                else 0,
             }
             filename = save_checkpoint(agent, episode + 1, run_id, final_metrics)
             wandb.save(filename)
@@ -524,13 +513,13 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
             print("\nAgent's decision:")
             if action.kind == ActionType.ROLL:
                 print("Action: ROLL all dice")
-            elif action.kind == ActionType.HOLD_MASK:
+            elif action.kind == ActionType.HOLD:
                 held = [i + 1 for i, hold in enumerate(action.data) if hold]
                 print(f"Action: Hold dice at positions {held}")
             else:
                 print(f"Action: Score {action.data.name}")
 
-        state, reward, done, _ = env.step(action_idx)
+        state, reward, done, info = env.step(action_idx)
         total_reward += reward
 
         if render:
@@ -585,15 +574,15 @@ def show_action_values(
     for i, (action_idx, value) in enumerate(valid_q[:num_top]):
         action = env.IDX_TO_ACTION[action_idx]
         if action.kind == ActionType.ROLL:
-            print(f"{i+1}. ROLL all dice (EV: {value:.1f})")
-        elif action.kind == ActionType.HOLD_MASK:
-            held = [i + 1 for i, hold in enumerate(action.data) if hold]
+            print(f"{i + 1}. ROLL all dice (EV: {value:.1f})")
+        elif action.kind == ActionType.HOLD:
+            held = [j + 1 for j, hold in enumerate(action.data) if hold]
             if held:
-                print(f"{i+1}. Hold dice {held} (EV: {value:.1f})")
+                print(f"{i + 1}. Hold dice {held} (EV: {value:.1f})")
             else:
-                print(f"{i+1}. ROLL all dice (EV: {value:.1f})")
+                print(f"{i + 1}. ROLL all dice (EV: {value:.1f})")
         else:
-            print(f"{i+1}. Score {action.data.name} (EV: {value:.1f})")
+            print(f"{i + 1}. Score {action.data.name} (EV: {value:.1f})")
 
     return state, valid_q[:num_top]
 
