@@ -186,7 +186,7 @@ class YahtzeeAgent:
         state_size: int,
         action_size: int,
         batch_size: int = 2048,
-        gamma: float = 0.99,
+        gamma: float = 0.97,  # lowered from 0.99
         learning_rate: float = 3e-4,
         target_update: int = 50,
         device: str = "cuda",

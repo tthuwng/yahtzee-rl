@@ -221,18 +221,16 @@ class YahtzeeEnv:
         )
         return 35 if upper_score >= 63 else 0
 
-    def calc_strategic_reward(
-        self, category: YahtzeeCategory, base_score: float
-    ) -> float:
+    def calc_strategic_reward(self, category: YahtzeeCategory, base_score: float) -> float:
         """
-        Calculate a 'shaped' reward for scoring, encouraging good Yahtzee tactics:
-        - Weighted bonuses for heading toward upper bonus or big combos
-        - Penalties for zeros in certain categories
+        Calculate a 'shaped' reward for scoring, encouraging better Yahtzee tactics:
+        - Increased penalty for zeros
+        - Larger bonuses for bigger combos
+        - More emphasis on aiming for upper bonus
         """
         dice = self.state.current_dice
         counts = np.bincount(dice)[1:] if any(dice) else []
         max_count = max(counts) if any(counts) else 0
-        unique_vals = np.unique(dice[dice > 0]) if any(dice) else []
 
         # track upper section
         upper_cats = [
@@ -244,60 +242,68 @@ class YahtzeeEnv:
             YahtzeeCategory.SIXES,
         ]
         upper_score_so_far = sum(self.state.score_sheet[cat] or 0 for cat in upper_cats)
-        upper_filled = sum(
-            1 for cat in upper_cats if self.state.score_sheet[cat] is not None
-        )
+        upper_filled = sum(1 for cat in upper_cats if self.state.score_sheet[cat] is not None)
 
-        # baseline is actual points scored
         bonus_reward = 0.0
 
-        # small baseline to reward any play
+        # Slight baseline for any valid scoring move
         bonus_reward += 2.0
 
-        # encourage big combos
-        if (
-            max_count >= 4
-            and self.state.score_sheet.get(YahtzeeCategory.YAHTZEE) is None
-        ):
-            bonus_reward += 8.0
-        elif max_count >= 3:
+        # Encourage big combos
+        if max_count >= 5:
+            # Yahtzee potential
+            bonus_reward += 12.0
+        elif max_count == 4:
+            bonus_reward += 6.0
+        elif max_count == 3:
             bonus_reward += 3.0
 
-        # partial reward for going after the upper bonus
+        # More emphasis on upper section progression
         if category in upper_cats:
-            # ideally we want 3 or more of a kind to keep pace
             val_index = upper_cats.index(category)
             val = val_index + 1
+            # If we get at least 3-of-a-kind for the category
             if base_score >= val * 3:
-                bonus_reward += 5.0
+                bonus_reward += 7.0
             else:
-                bonus_reward += 1.0  # any progress is decent
+                bonus_reward += 2.0  # minor for anything in that category
 
-            # small scaling for higher face categories
-            bonus_reward += val * 0.2
+            # Scale bigger face categories slightly
+            bonus_reward += val * 0.3
 
-            # if close to hitting 63 early, bigger push
+            # If close to 63 early, bigger push
             if (upper_score_so_far + base_score) >= 63 and upper_filled < 5:
-                bonus_reward += 4.0
+                bonus_reward += 6.0
 
-        # reward full house, straights
+        # Reward special combos
         if category == YahtzeeCategory.FULL_HOUSE and base_score == 25:
-            bonus_reward += 4.0
-        elif category == YahtzeeCategory.SMALL_STRAIGHT and base_score == 30:
-            bonus_reward += 5.0
-        elif category == YahtzeeCategory.LARGE_STRAIGHT and base_score == 40:
             bonus_reward += 6.0
+        elif category == YahtzeeCategory.SMALL_STRAIGHT and base_score == 30:
+            bonus_reward += 7.0
+        elif category == YahtzeeCategory.LARGE_STRAIGHT and base_score == 40:
+            bonus_reward += 9.0
         elif category == YahtzeeCategory.YAHTZEE and base_score == 50:
-            bonus_reward += 10.0
+            bonus_reward += 15.0
 
-        # penalize zeroing out potentially valuable categories
+        # Stronger penalties for zeroing out high-potential categories
         if base_score == 0:
+            # If it's CHANCE and we got 0, likely we had no dice, punish heavily
             if category == YahtzeeCategory.CHANCE:
-                bonus_reward -= 10.0
+                bonus_reward -= 12.0
             else:
-                bonus_reward -= 4.0
+                # More severe penalty for categories that can yield large points
+                if category in [
+                    YahtzeeCategory.THREE_OF_A_KIND,
+                    YahtzeeCategory.FOUR_OF_A_KIND,
+                    YahtzeeCategory.FULL_HOUSE,
+                    YahtzeeCategory.SMALL_STRAIGHT,
+                    YahtzeeCategory.LARGE_STRAIGHT,
+                    YahtzeeCategory.YAHTZEE,
+                ]:
+                    bonus_reward -= 8.0
+                else:
+                    bonus_reward -= 5.0
 
-        # final combined reward
         return base_score + bonus_reward
 
     def step(self, action_idx: int) -> Tuple[GameState, float, bool, dict]:
