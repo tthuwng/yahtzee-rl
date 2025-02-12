@@ -1,94 +1,53 @@
-from typing import Dict, List, Tuple
+from typing import List
 
 import numpy as np
 
-from env import Action, YahtzeeCategory
+from env import Action, GameState
 
 
 class StateEncoder:
     """Efficient state encoder with focused feature set."""
 
-    def __init__(self, use_opponent_value: bool = False) -> None:
-        self.categories = list(YahtzeeCategory)
-        self.num_categories = len(self.categories)
+    def __init__(self, use_opponent_value: bool = True) -> None:
         self.use_opponent_value = use_opponent_value
-        
-        # Pre-compute category indices for faster lookup
-        self.upper_cats = [
-            YahtzeeCategory.ONES,
-            YahtzeeCategory.TWOS,
-            YahtzeeCategory.THREES,
-            YahtzeeCategory.FOURS,
-            YahtzeeCategory.FIVES,
-            YahtzeeCategory.SIXES,
-        ]
-        
+
         # Calculate state size based on feature set
-        self.state_size = (
-            1  # Number of rerolls left
-            + 6  # Count of each die value (1-6)
-            + self.num_categories  # Player scorecard (filled categories)
-            + 2  # Player upper and lower scores
-            + (1 if use_opponent_value else 0)  # Opponent value (optional)
+        self.state_size = 70
+
+    def encode(self, state: GameState) -> np.ndarray:
+        # Encode dice values (5 dice, one-hot encoded 1-6)
+        dice_encoding = np.zeros(30)  # 5 dice * 6 possible values
+        for i, value in enumerate(state.current_dice):
+            if value > 0:
+                dice_encoding[i * 6 + (value - 1)] = 1
+
+        # Encode rolls left (one-hot encoded 0-3)
+        rolls_left_encoding = np.zeros(3)
+        if state.rolls_left > 0:
+            rolls_left_encoding[state.rolls_left - 1] = 1
+
+        # Encode score sheet (13 categories * 2 for filled and value)
+        score_sheet_encoding = np.zeros(26)
+        for i, (cat, score) in enumerate(state.score_sheet.items()):
+            score_sheet_encoding[i * 2] = score is not None
+            score_sheet_encoding[i * 2 + 1] = (score or 0) / 50.0  # Normalize values
+
+        # Encode opponent score sheet if enabled
+        opponent_encoding = np.zeros(11) if self.use_opponent_value else np.array([])
+        if self.use_opponent_value and hasattr(state, "opponent_score_sheet"):
+            total = sum(state.score_sheet[cat] or 0 for cat in state.score_sheet)
+            opponent_encoding[0] = total / 100.0  # Normalize total
+            for i, (cat, score) in enumerate(state.score_sheet.items()):
+                opponent_encoding[i + 1] = (score or 0) / 50.0  # Normalize values
+
+        return np.concatenate(
+            [
+                dice_encoding,  # 30 features
+                rolls_left_encoding,  # 3 features
+                score_sheet_encoding,  # 26 features
+                opponent_encoding,  # 11 features if enabled
+            ]
         )
-        
-        # Validate state size matches expected dimensions
-        expected_size = 22 if not use_opponent_value else 23
-        if self.state_size != expected_size:
-            raise ValueError(
-                f"State size mismatch. Expected {expected_size}, got {self.state_size}"
-            )
-
-    def _get_dice_counts(self, dice: np.ndarray) -> np.ndarray:
-        """Get counts of each dice value (1-6)."""
-        return np.bincount(dice, minlength=7)[1:]  # Skip index 0
-
-    def _get_score_summary(self, scores: Dict[YahtzeeCategory, int]) -> Tuple[float, float]:
-        """Calculate normalized upper and lower section scores."""
-        upper_score = sum(scores[cat] or 0 for cat in self.upper_cats)
-        lower_score = sum(
-            scores[cat] or 0 
-            for cat in self.categories 
-            if cat not in self.upper_cats
-        )
-        
-        # Normalize scores
-        upper_score = min(upper_score / 63.0, 1.0)  # 63 is bonus threshold
-        lower_score = min(lower_score / 200.0, 1.0)  # 200 is approximate max lower score
-        
-        return upper_score, lower_score
-
-    def encode(self, state, opponent_value: float = 0.0) -> np.ndarray:
-        """Convert game state to vector representation."""
-        vec = np.zeros(self.state_size, dtype=np.float32)
-        idx = 0
-
-        # 1. Rolls left (normalized)
-        vec[idx] = state.rolls_left / 3.0
-        idx += 1
-
-        # 2. Dice counts
-        dice_counts = self._get_dice_counts(state.current_dice)
-        counts_slice = slice(idx, idx + 6)
-        vec[counts_slice] = dice_counts / 5.0  # Normalize by max possible count
-        idx += 6
-
-        # 3. Category flags (filled/unfilled)
-        for cat in self.categories:
-            vec[idx] = 1.0 if state.score_sheet[cat] is not None else 0.0
-            idx += 1
-
-        # 4. Upper and lower scores
-        upper_score, lower_score = self._get_score_summary(state.score_sheet)
-        vec[idx] = upper_score
-        vec[idx + 1] = lower_score
-        idx += 2
-
-        # 5. Opponent value (if used)
-        if self.use_opponent_value:
-            vec[idx] = opponent_value
-
-        return vec
 
 
 class ActionMapper:
