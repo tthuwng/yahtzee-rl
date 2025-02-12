@@ -383,6 +383,7 @@ def train(
                         rewards,
                         next_state_vecs,
                         new_dones,
+                        active_indices,
                     )
                     if loss is not None:
                         episode_losses.append(loss)
