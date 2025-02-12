@@ -223,7 +223,7 @@ def train(
 
     # Switch to potential-based if objective == "win"
     reward_strat = (
-        RewardStrategy.POTENTIAL if objective == "win" else RewardStrategy.STANDARD
+        RewardStrategy.POTENTIAL if objective == "win" else RewardStrategy.STRATEGIC
     )
 
     envs = [YahtzeeEnv(reward_strategy=reward_strat) for _ in range(num_envs)]
@@ -308,10 +308,10 @@ def train(
                         actual_scores.append(info["final_score"])
 
                 agent.train_step_batch(
-                    [states[a] for a in active_indices],
+                    [encoders[a].encode(states[a], opponent_value=0.5 if objective == "win" else 0.0) for a in active_indices],
                     actions,
                     rewards_,
-                    [next_states[i] for i in range(len(active_indices))],
+                    [encoders[idx].encode(next_states[i], opponent_value=0.5 if objective == "win" else 0.0) for i, idx in enumerate(active_indices)],
                     new_dones,
                     env_indices=active_indices
                 )
@@ -586,7 +586,7 @@ def main():
         "--checkpoint", type=str, help="Path to checkpoint to resume from"
     )
     parser.add_argument(
-        "--num_envs", type=int, default=64, help="Number of parallel environments"
+        "--num_envs", type=int, default=32, help="Number of parallel environments"
     )
     parser.add_argument(
         "--objective",
@@ -604,3 +604,6 @@ def main():
         num_envs=args.num_envs,
         objective=args.objective,
     )
+
+if __name__ == "__main__":
+    main()
