@@ -244,6 +244,9 @@ class YahtzeeEnv(gym.Env):
     def calc_strategic_reward(
         self, category: YahtzeeCategory, base_score: float
     ) -> float:
+        """
+        Modified to increase positive rewards and reduce harsh penalties for zero.
+        """
         dice = self.state.current_dice
         counts = np.bincount(dice)[1:] if any(dice) else []
         max_count = max(counts) if len(counts) > 0 else 0
@@ -252,15 +255,21 @@ class YahtzeeEnv(gym.Env):
 
         # Increase bonus for non-zero scoring
         if base_score > 0:
-            bonus_reward += 3.0  # was 2.0
+            # was +3.0 => now +5.0
+            bonus_reward += 5.0
         else:
-            bonus_reward -= 10.0  # was -8.0
+            # was -10.0 => now -4.0
+            bonus_reward -= 4.0
 
+        # Reward for sets
         if max_count >= 4 and (self.state.score_sheet.get(YahtzeeCategory.YAHTZEE) is None):
-            bonus_reward += 12.0  # was 10.0
+            # was +12.0 => now +15.0
+            bonus_reward += 15.0
         elif max_count >= 3:
-            bonus_reward += 5.0   # was 4.0
+            # was +5.0 => now +8.0
+            bonus_reward += 8.0
 
+        # Check if category is an upper category
         upper_cats = [
             YahtzeeCategory.ONES,
             YahtzeeCategory.TWOS,
@@ -278,29 +287,39 @@ class YahtzeeEnv(gym.Env):
             val_index = upper_cats.index(category)
             face_val = val_index + 1
             if base_score >= face_val * 3:
-                bonus_reward += 8.0  # was 7.0
+                # was +8.0 => now +10.0
+                bonus_reward += 10.0
             else:
                 bonus_reward += 2.0
-            bonus_reward += face_val * 0.5  # scale up a bit from 0.3
+            # scaled up from 0.5 => 0.8
+            bonus_reward += face_val * 0.8
 
             if (upper_score_so_far + base_score) >= 63 and upper_filled < 5:
-                bonus_reward += 7.0  # was 6.0
+                # was +7.0 => now +10.0
+                bonus_reward += 10.0
 
+        # Special categories
         if category == YahtzeeCategory.FULL_HOUSE and base_score == 25:
-            bonus_reward += 7.0  # was 5.0
+            # was +7.0 => now +10.0
+            bonus_reward += 10.0
         elif category == YahtzeeCategory.SMALL_STRAIGHT and base_score == 30:
-            bonus_reward += 8.0  # was 6.0
+            # was +8.0 => now +12.0
+            bonus_reward += 12.0
         elif category == YahtzeeCategory.LARGE_STRAIGHT and base_score == 40:
-            bonus_reward += 10.0 # was 8.0
+            # was +10.0 => now +15.0
+            bonus_reward += 15.0
         elif category == YahtzeeCategory.YAHTZEE and base_score == 50:
-            bonus_reward += 20.0 # was 15.0
+            # was +20.0 => now +30.0
+            bonus_reward += 30.0
 
+        # If it's zero in big categories, reduce penalty
         if base_score == 0 and category in [
             YahtzeeCategory.FULL_HOUSE,
             YahtzeeCategory.LARGE_STRAIGHT,
             YahtzeeCategory.YAHTZEE,
         ]:
-            bonus_reward -= 7.0  # was -5.0
+            # was -7.0 => now -3.0
+            bonus_reward -= 3.0
 
         return base_score + bonus_reward
 

@@ -110,7 +110,7 @@ class PrioritizedReplayBuffer:
         self.capacity = capacity
         self.alpha = alpha
         self.beta = beta
-        self.beta_increment = 0.002  # keep as is or adjust if needed
+        self.beta_increment = 0.002
         self.buffer: List[Transition] = []
         self.device = torch.device(device)
         self.priorities = torch.zeros(capacity, dtype=torch.float32, device=self.device)
@@ -151,7 +151,6 @@ class PrioritizedReplayBuffer:
 
         batch = [self.buffer[idx.item()] for idx in indices]
 
-        # Convert numpy arrays to tensors
         states = torch.from_numpy(np.stack([t.state for t in batch])).float().to(device)
         actions = torch.tensor([t.action for t in batch], dtype=torch.long).to(device)
         rewards = torch.tensor([t.reward for t in batch], dtype=torch.float).to(device)
@@ -183,13 +182,13 @@ class YahtzeeAgent:
         state_size: int,
         action_size: int,
         batch_size: int = 2048,
-        gamma: float = 0.99,       # raised from 0.97
-        learning_rate: float = 2e-4,  # lowered from 3e-4
+        gamma: float = 0.99,
+        learning_rate: float = 1e-4,     # lowered from 2e-4
         target_update: int = 50,
         device: str = "cuda",
         min_epsilon: float = 0.02,
-        epsilon_decay: float = 0.9992,  # slower decay
-        n_step: int = 3,               # multi-step returns
+        epsilon_decay: float = 0.9992,
+        n_step: int = 5,                # increased from 3 to 5
     ) -> None:
         self.state_size = state_size
         self.action_size = action_size
@@ -202,11 +201,10 @@ class YahtzeeAgent:
         self.n_step = n_step
         self.latest_loss: Optional[float] = None
 
-        # N-step storage: for each environment we'll keep a short queue of (state,action,...) until we can pop it.
-        # key = env index, value = deque of partial transitions
+        # N-step storage
         self.n_step_buffers = {}
 
-        # Initialize networks
+        # Networks
         self.policy_net = DQN(state_size, action_size).to(self.device)
         self.target_net = DQN(state_size, action_size).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -214,20 +212,18 @@ class YahtzeeAgent:
         for param in self.target_net.parameters():
             param.requires_grad = False
 
-        # Exploration params
         self.epsilon = 1.0
         self.epsilon_min = min_epsilon
         self.epsilon_decay = epsilon_decay
 
-        # Replay buffer with updated alpha/beta
+        # Replay buffer with updated capacity
         self.buffer = PrioritizedReplayBuffer(
-            capacity=100000,
+            capacity=200000,  # increased from 100000
             alpha=0.7,
             beta=0.5,
             device=device,
         )
 
-        # Optimizer + scheduler
         self.optimizer = optim.AdamW(
             self.policy_net.parameters(),
             lr=learning_rate,
@@ -235,7 +231,7 @@ class YahtzeeAgent:
             amsgrad=True,
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=20000, eta_min=1e-5
+            self.optimizer, T_max=40000, eta_min=1e-5  # increased T_max from 20000
         )
 
     def train(self) -> None:
@@ -285,14 +281,8 @@ class YahtzeeAgent:
         final_next_state: np.ndarray,
         final_done: bool
     ) -> None:
-        """
-        After collecting n-step transitions in the local buffer for env_idx,
-        compute the multi-step return and push to replay buffer.
-        """
         buffer = self.n_step_buffers[env_idx]
-        # The first transition in the queue is the one we are finalizing
         first = buffer[0]
-        # sum of discounted rewards from first step onwards
         total_reward = 0.0
         gamma_multiplier = 1.0
         for (s, a, r) in [(t.state, t.action, t.reward) for t in buffer]:
@@ -328,12 +318,7 @@ class YahtzeeAgent:
         dones: List[bool],
         env_indices: List[int] = None
     ) -> float:
-        """
-        Multi-step version: accumulate transitions for each env in n_step_buffers.
-        When we have n transitions or the env is done, push to replay.
-        """
         if env_indices is None:
-            # fallback if not provided
             env_indices = list(range(len(states)))
 
         for i, (s, a, r, ns, d) in enumerate(
@@ -344,24 +329,19 @@ class YahtzeeAgent:
                 from collections import deque
                 self.n_step_buffers[env_idx] = deque(maxlen=self.n_step)
 
-            # Add the new single-step to the buffer
             self.n_step_buffers[env_idx].append(Transition(s, a, r, ns, d, 1.0))
 
-            # If we have n steps, finalize the earliest transition
             if len(self.n_step_buffers[env_idx]) == self.n_step:
                 self._push_n_step_transition(env_idx, ns, d)
 
-            # If done, flush everything left for that env
             if d:
                 while len(self.n_step_buffers[env_idx]) > 0:
                     self._push_n_step_transition(env_idx, ns, d)
 
-        # We can only learn if there's enough data
         if len(self.buffer) < self.batch_size:
             self.latest_loss = None
             return 0.0
 
-        # Sample from replay buffer
         states_t, actions_t, rewards_t, next_states_t, dones_t, weights, indices = (
             self.buffer.sample(self.batch_size, self.device)
         )
