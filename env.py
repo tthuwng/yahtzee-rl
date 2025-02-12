@@ -1,160 +1,202 @@
-from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+import random
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
 
+import gymnasium as gym
 import numpy as np
+from gymnasium import spaces
+from yahtzee_types import Action, ActionType, GameState, YahtzeeCategory
 
-__all__ = [
-    "YahtzeeCategory",
-    "ActionType",
-    "Action",
-    "GameState",
-    "YahtzeeEnv",
-    "NUM_ACTIONS",
-    "IDX_TO_ACTION",
-]
-
-# Initialize constants at module level
-NUM_ACTIONS = 46  # 1 ROLL + 32 HOLD + 13 SCORE actions
-IDX_TO_ACTION = {}  # Will be populated by YahtzeeEnv
+from encoder import NUM_ACTIONS, ActionMapper, StateEncoder
 
 
-class YahtzeeCategory(Enum):
-    """Categories in Yahtzee."""
+class RewardStrategy(Enum):
+    """Different strategies for shaping the reward signal."""
 
-    ONES = auto()
-    TWOS = auto()
-    THREES = auto()
-    FOURS = auto()
-    FIVES = auto()
-    SIXES = auto()
-    THREE_OF_A_KIND = auto()
-    FOUR_OF_A_KIND = auto()
-    FULL_HOUSE = auto()
-    SMALL_STRAIGHT = auto()
-    LARGE_STRAIGHT = auto()
-    YAHTZEE = auto()
-    CHANCE = auto()
+    STANDARD = "standard"
+    STRATEGIC = "strategic"
+    NORMALIZED = "normalized"
+    SPARSE = "sparse"
+    POTENTIAL = "potential"
 
 
-class ActionType(Enum):
-    """Types of actions in Yahtzee."""
+class YahtzeeEnv(gym.Env):
+    """Unified Yahtzee environment with gym interface."""
 
-    ROLL = auto()  # Roll all dice
-    HOLD = auto()  # Hold some dice
-    SCORE = auto()  # Score a category
+    metadata = {"render_modes": ["human", "ansi"]}
 
+    def __init__(
+        self,
+        use_opponent_value: bool = False,
+        reward_strategy: RewardStrategy = RewardStrategy.STRATEGIC,
+        render_mode: Optional[str] = None,
+    ):
+        super().__init__()
+        self.use_opponent_value = use_opponent_value
+        self.reward_strategy = reward_strategy
+        self.render_mode = render_mode
 
-@dataclass(frozen=True)
-class Action:
-    """Action in Yahtzee game."""
+        # For potential-based shaping
+        self._last_potential: Optional[float] = None
 
-    kind: ActionType
-    data: Optional[object] = None  # bool array for HOLD, YahtzeeCategory for SCORE
+        # Initialize encoders and action mapping
+        self.encoder = StateEncoder(use_opponent_value=use_opponent_value)
+        self.action_mapper = ActionMapper()
+        self._opponent_value = 0.5 if use_opponent_value else 0.0
 
-    def __hash__(self):
-        if self.kind == ActionType.HOLD and self.data is not None:
-            # Convert numpy array to tuple for hashing
-            return hash((self.kind, tuple(self.data)))
-        return hash((self.kind, self.data))
+        # Gym Spaces
+        self.action_space = spaces.Discrete(NUM_ACTIONS)
+        obs_size = 22 if not use_opponent_value else 23
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
+        )
 
+        # Initialize game state
+        self.state: GameState = GameState(
+            current_dice=np.zeros(5, dtype=int),
+            rolls_left=3,
+            score_sheet={cat: None for cat in YahtzeeCategory},
+        )
 
-@dataclass
-class GameState:
-    """Current state of Yahtzee game."""
+    def reset(
+        self, seed: Optional[int] = None, options: Optional[Dict] = None
+    ) -> GameState:
+        """
+        Maintains backward-compatibility with older code:
+          env.reset() -> GameState
 
-    current_dice: np.ndarray  # Values of 5 dice
-    rolls_left: int  # Rolls remaining this turn
-    score_sheet: Dict[YahtzeeCategory, Optional[int]]  # Category -> score or None
+        Also readies the environment for gym usage (by storing observation in info).
+        If you need gym-style returns, see info["obs"] after calling reset.
+        """
+        if seed is not None:
+            super().reset(seed=seed)
 
+        # Reset potential if we're using potential-based shaping
+        self._last_potential = None
 
-class YahtzeeEnv:
-    """Yahtzee environment with simplified rules."""
-
-    def __init__(self):
-        # Generate all possible hold combinations (32 total)
-        self.hold_masks = []
-        for bits in range(32):
-            mask = [(bits & (1 << i)) != 0 for i in range(5)]
-            self.hold_masks.append(np.array(mask, dtype=bool))
-
-        # Generate all possible actions
-        self.all_actions = []
-        # Roll action
-        self.all_actions.append(Action(ActionType.ROLL))
-        # Hold actions
-        for mask in self.hold_masks:
-            # Convert numpy array to tuple for proper hashing
-            hold_action = Action(ActionType.HOLD, tuple(mask))
-            self.all_actions.append(hold_action)
-        # Score actions
-        for cat in YahtzeeCategory:
-            self.all_actions.append(Action(ActionType.SCORE, cat))
-
-        # Create action mappings
-        self.action_to_idx = {act: i for i, act in enumerate(self.all_actions)}
-        self.idx_to_action = {i: act for i, act in enumerate(self.all_actions)}
-        self.num_actions = len(self.all_actions)
-
-        # Update global IDX_TO_ACTION
-        global IDX_TO_ACTION
-        IDX_TO_ACTION.update(self.idx_to_action)
-
-    def reset(self) -> GameState:
-        """Start new game."""
         self.state = GameState(
             current_dice=np.zeros(5, dtype=int),
             rolls_left=3,
             score_sheet={cat: None for cat in YahtzeeCategory},
         )
+
+        # Return the game state to keep old code working
         return self.state
 
-    def roll_dice(self, hold_mask: np.ndarray) -> None:
-        """Roll unheld dice."""
+    # --------------------------------------------------------------------------------
+    # Old style step: returns (GameState, reward, done, info).
+    # Also we embed the computed observation in info['obs'] if needed.
+    # --------------------------------------------------------------------------------
+    def step(self, action_idx: int) -> Tuple[GameState, float, bool, dict]:
+        """Step the environment with an action index."""
+        # Validate
+        if action_idx < 0 or action_idx >= NUM_ACTIONS:
+            raise ValueError(f"Invalid action index {action_idx}")
+
+        action = self.action_mapper.index_to_action(action_idx)
+        reward = 0.0
+        done = False
+        info: Dict[str, Any] = {"action_type": action.kind.name}
+
+        # If scoring, we'll check base_score for shaping logic
+        base_score = 0
+
+        # ROLL or HOLD
+        if action.kind == ActionType.ROLL:
+            if self.state.rolls_left <= 0:
+                raise ValueError("No rolls left!")
+            self._roll_dice(np.zeros(5, dtype=bool))
+            info["dice_rolled"] = True
+
+        elif action.kind == ActionType.HOLD:
+            if self.state.rolls_left <= 0:
+                raise ValueError("No rolls left!")
+            if not np.any(self.state.current_dice):
+                raise ValueError("Cannot hold empty dice!")
+            hold_mask = np.array(action.data, dtype=bool)
+            self._roll_dice(hold_mask)
+            info["dice_held"] = np.where(hold_mask)[0].tolist()
+
+        elif action.kind == ActionType.SCORE:
+            category = action.data
+            if self.state.score_sheet[category] is not None:
+                raise ValueError(f"Category {category} already filled!")
+            if not np.any(self.state.current_dice):
+                raise ValueError("Cannot score empty dice!")
+            # Compute points
+            points = self.calc_score(category, self.state.current_dice)
+            base_score = points
+
+            # The environment's default reward is the shaped reward
+            shaped = self._shape_reward(
+                float(points), action, done=False, base_score=points
+            )
+            reward = shaped
+
+            # Assign points
+            self.state.score_sheet[category] = points
+            info["category_scored"] = category.name
+            info["points_scored"] = points
+
+            # Check if game is over
+            if all(sc is not None for sc in self.state.score_sheet.values()):
+                done = True
+                bonus = self.calc_upper_bonus()
+                reward += bonus  # add bonus to final reward
+                info["upper_bonus"] = bonus
+                info["final_score"] = (
+                    sum(
+                        score
+                        for score in self.state.score_sheet.values()
+                        if score is not None
+                    )
+                    + bonus
+                )
+
+            # Reset dice for next turn
+            self.state.current_dice = np.zeros(5, dtype=int)
+            self.state.rolls_left = 3
+
+        # Now if the action was ROLL or HOLD, we do standard reward shaping
+        else:
+            # This shouldn't happen, but let's keep consistent
+            shaped = self._shape_reward(0.0, action, done=False, base_score=0)
+            reward = shaped
+
+        # If done, do potential shaping one last time if needed
+        if done:
+            # shape again with final done if needed
+            reward = self._shape_reward(
+                reward, action, done=True, base_score=base_score
+            )
+
+        # Create obs for info
+        obs = self.encoder.encode(self.state, opponent_value=self._opponent_value)
+        info["obs"] = obs
+
+        return self.state, reward, done, info
+
+    def _roll_dice(self, hold_mask: np.ndarray):
         if self.state.rolls_left <= 0:
             raise ValueError("No rolls left!")
         for i in range(5):
             if not hold_mask[i]:
-                self.state.current_dice[i] = np.random.randint(1, 7)
+                self.state.current_dice[i] = random.randint(1, 6)
         self.state.rolls_left -= 1
 
     def get_valid_actions(self) -> List[int]:
-        """Get list of valid action indices."""
-        valid = []
+        """List of valid action indices for the current state."""
+        return self.action_mapper.get_valid_actions(self.state)
 
-        # Can only roll or hold if have rolls left and game not over
-        has_rolls = self.state.rolls_left > 0
-        not_finished = None in self.state.score_sheet.values()
-        if has_rolls and not_finished:
-            # Can always roll all dice if not showing any dice
-            if not np.any(self.state.current_dice):
-                valid.append(self.action_to_idx[Action(ActionType.ROLL)])
-            else:
-                # Can roll or hold if showing dice
-                valid.append(self.action_to_idx[Action(ActionType.ROLL)])
-                for mask in self.hold_masks:
-                    if np.any(mask):  # Only add if actually holding dice
-                        # Convert numpy array to tuple for proper hashing
-                        hold_action = Action(ActionType.HOLD, tuple(mask))
-                        valid.append(self.action_to_idx[hold_action])
-
-        # Can score if:
-        # 1. Category is not filled
-        # 2. Have dice showing
-        if np.any(self.state.current_dice):
-            for cat in YahtzeeCategory:
-                if self.state.score_sheet[cat] is None:
-                    valid.append(self.action_to_idx[Action(ActionType.SCORE, cat)])
-
-        return valid
-
+    # --------------------------------------------------------------------------------
+    # Score calculations and final scoring
+    # --------------------------------------------------------------------------------
     def calc_score(self, category: YahtzeeCategory, dice: np.ndarray) -> int:
-        """Calculate score for category."""
-        if not np.any(dice > 0):  # Can't score empty dice
+        """Calculate the base score for a category."""
+        if not np.any(dice > 0):  # no dice shown
             return 0
 
-        counts = np.bincount(dice, minlength=7)[1:]  # Skip index 0
-
+        counts = np.bincount(dice, minlength=7)[1:]  # skip index 0
         if category == YahtzeeCategory.ONES:
             return counts[0] * 1
         elif category == YahtzeeCategory.TWOS:
@@ -168,34 +210,29 @@ class YahtzeeEnv:
         elif category == YahtzeeCategory.SIXES:
             return counts[5] * 6
         elif category == YahtzeeCategory.THREE_OF_A_KIND:
-            for val, count in enumerate(counts, 1):
-                if count >= 3:
-                    return dice.sum()
+            if max(counts) >= 3:
+                return dice.sum()
             return 0
         elif category == YahtzeeCategory.FOUR_OF_A_KIND:
-            for val, count in enumerate(counts, 1):
-                if count >= 4:
-                    return dice.sum()
+            if max(counts) >= 4:
+                return dice.sum()
             return 0
         elif category == YahtzeeCategory.FULL_HOUSE:
-            has_three = False
-            has_two = False
-            three_val = None
-            for val, count in enumerate(counts, 1):
-                if count == 3:
-                    has_three = True
-                    three_val = val
-                elif count == 2 and (not has_three or val != three_val):
-                    has_two = True
+            # check 3-of-a-kind + 2-of-a-kind
+            has_three = any(c == 3 for c in counts)
+            has_two = any(c == 2 for c in counts)
             return 25 if has_three and has_two else 0
         elif category == YahtzeeCategory.SMALL_STRAIGHT:
+            # unique sorted
             sorted_unique = np.unique(dice)
-            for straight in [[1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6]]:
-                if all(x in sorted_unique for x in straight):
+            straights = [[1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6]]
+            for st in straights:
+                if all(x in sorted_unique for x in st):
                     return 30
             return 0
         elif category == YahtzeeCategory.LARGE_STRAIGHT:
             sorted_unique = np.unique(dice)
+            # [1..5] or [2..6]
             if len(sorted_unique) == 5 and (
                 all(x in sorted_unique for x in [1, 2, 3, 4, 5])
                 or all(x in sorted_unique for x in [2, 3, 4, 5, 6])
@@ -203,40 +240,98 @@ class YahtzeeEnv:
                 return 40
             return 0
         elif category == YahtzeeCategory.YAHTZEE:
-            return 50 if np.any(counts == 5) else 0
+            if max(counts) == 5:
+                return 50
+            return 0
         elif category == YahtzeeCategory.CHANCE:
             return dice.sum()
         else:
-            raise ValueError(f"Unknown category: {category}")
+            return 0
 
     def calc_upper_bonus(self) -> int:
-        """Calculate upper section bonus."""
-        upper_score = sum(
-            self.state.score_sheet[cat] or 0
-            for cat in [
-                YahtzeeCategory.ONES,
-                YahtzeeCategory.TWOS,
-                YahtzeeCategory.THREES,
-                YahtzeeCategory.FOURS,
-                YahtzeeCategory.FIVES,
-                YahtzeeCategory.SIXES,
-            ]
-        )
+        """Compute the standard Yahtzee upper bonus if >= 63 in upper categories."""
+        upper_cats = [
+            YahtzeeCategory.ONES,
+            YahtzeeCategory.TWOS,
+            YahtzeeCategory.THREES,
+            YahtzeeCategory.FOURS,
+            YahtzeeCategory.FIVES,
+            YahtzeeCategory.SIXES,
+        ]
+        upper_score = sum(self.state.score_sheet[cat] or 0 for cat in upper_cats)
         return 35 if upper_score >= 63 else 0
+
+    # --------------------------------------------------------------------------------
+    # Reward shaping methods
+    # --------------------------------------------------------------------------------
+    def _shape_reward(
+        self, reward: float, action: Action, done: bool, base_score: float
+    ) -> float:
+        """Apply the reward strategy shaping."""
+        if self.reward_strategy == RewardStrategy.STANDARD:
+            # no shaping, just keep the environment's raw reward
+            return reward
+
+        elif self.reward_strategy == RewardStrategy.STRATEGIC:
+            # use the internal strategic approach if scoring
+            if action.kind == ActionType.SCORE:
+                return self.calc_strategic_reward(action.data, base_score)
+            else:
+                # ROLL/HOLD yield no direct points but small or 0 shaping
+                return reward
+
+        elif self.reward_strategy == RewardStrategy.NORMALIZED:
+            # naive normalization
+            # assume max single scoring is about 50 for base, clip
+            return float(np.clip(reward / 50.0, -1.0, 1.0))
+
+        elif self.reward_strategy == RewardStrategy.SPARSE:
+            # only reward at the end
+            return reward if done else 0.0
+
+        elif self.reward_strategy == RewardStrategy.POTENTIAL:
+            # potential-based shaping
+            current_potential = self._compute_potential()
+            if self._last_potential is None:
+                shaped_reward = reward
+            else:
+                shaped_reward = reward + (
+                    0.99 * current_potential - self._last_potential
+                )
+            self._last_potential = current_potential
+            return shaped_reward
+
+        return reward
 
     def calc_strategic_reward(
         self, category: YahtzeeCategory, base_score: float
     ) -> float:
         """
-        Calculate a 'shaped' reward for scoring, encouraging better Yahtzee tactics:
-        - Strong baseline reward if >0 points
-        - Larger negative penalty for scoring 0, especially on big categories
-        - Slightly more emphasis on upper bonus
+        A shaped reward encouraging good Yahtzee tactics.
+        We do something similar to the older approach in the original code.
         """
         dice = self.state.current_dice
         counts = np.bincount(dice)[1:] if any(dice) else []
-        max_count = max(counts) if any(counts) else 0
+        max_count = max(counts) if len(counts) > 0 else 0
 
+        bonus_reward = 0.0
+
+        # reward if base_score > 0
+        if base_score > 0:
+            bonus_reward += 2.0
+        else:
+            # penalty for 0
+            bonus_reward -= 8.0
+
+        # encourage bigger combos
+        if max_count >= 4 and (
+            self.state.score_sheet.get(YahtzeeCategory.YAHTZEE) is None
+        ):
+            bonus_reward += 10.0
+        elif max_count >= 3:
+            bonus_reward += 4.0
+
+        # upper categories
         upper_cats = [
             YahtzeeCategory.ONES,
             YahtzeeCategory.TWOS,
@@ -250,42 +345,22 @@ class YahtzeeEnv:
             1 for cat in upper_cats if self.state.score_sheet[cat] is not None
         )
 
-        bonus_reward = 0.0
-
-        # Give a small baseline if we actually score > 0
-        if base_score > 0:
-            bonus_reward += 2.0
-        else:
-            # Larger penalty for scoring zero
-            bonus_reward -= 8.0
-
-        # Encourage big combos
-        if (
-            max_count >= 4
-            and self.state.score_sheet.get(YahtzeeCategory.YAHTZEE) is None
-        ):
-            bonus_reward += 10.0
-        elif max_count >= 3:
-            bonus_reward += 4.0
-
-        # Emphasize upper category progression
         if category in upper_cats:
+            # if we got at least 3 of that face
             val_index = upper_cats.index(category)
-            val = val_index + 1
-            # If we get at least 3-of-a-kind for the chosen face
-            if base_score >= val * 3:
+            face_val = val_index + 1
+            if base_score >= face_val * 3:
                 bonus_reward += 7.0
             else:
-                bonus_reward += 2.0  # minor reward for filling that category anyway
+                bonus_reward += 2.0
+            # slight scale for bigger faces
+            bonus_reward += face_val * 0.3
 
-            # Slightly scale bigger faces
-            bonus_reward += val * 0.3
-
-            # If close to 63 early
+            # encourage finishing the upper bonus early
             if (upper_score_so_far + base_score) >= 63 and upper_filled < 5:
                 bonus_reward += 6.0
 
-        # Reward special combos
+        # special combos
         if category == YahtzeeCategory.FULL_HOUSE and base_score == 25:
             bonus_reward += 5.0
         elif category == YahtzeeCategory.SMALL_STRAIGHT and base_score == 30:
@@ -295,97 +370,65 @@ class YahtzeeEnv:
         elif category == YahtzeeCategory.YAHTZEE and base_score == 50:
             bonus_reward += 15.0
 
-        # If we scored 0 on big combos, penalize further
+        # penalty for scoring 0 on big combos
         if base_score == 0 and category in [
             YahtzeeCategory.FULL_HOUSE,
             YahtzeeCategory.LARGE_STRAIGHT,
             YahtzeeCategory.YAHTZEE,
         ]:
-            bonus_reward -= 5.0  # extra penalty on top of baseline -8
+            bonus_reward -= 5.0
 
         return base_score + bonus_reward
 
-    def step(self, action_idx: int) -> Tuple[GameState, float, bool, dict]:
-        """Take action and return (next_state, reward, done, info)."""
-        if action_idx not in self.idx_to_action:
-            raise ValueError(f"Invalid action index: {action_idx}")
+    def _compute_potential(self) -> float:
+        """
+        Potential-based shaping function: consider average score so far,
+        moves left, etc. We just do a simple approach for demonstration.
+        """
+        total_score = sum(
+            sc for sc in self.state.score_sheet.values() if sc is not None
+        )
+        moves_left = sum(1 for sc in self.state.score_sheet.values() if sc is None)
+        # naive potential
+        if moves_left < 13:
+            avg_per_move = (
+                total_score / (13 - moves_left) if (13 - moves_left) > 0 else 0
+            )
+        else:
+            avg_per_move = 0
+        potential = avg_per_move * moves_left
+        # scale
+        return potential / 100.0
 
-        action = self.idx_to_action[action_idx]
-        reward = 0.0
-        done = False
-        info = {"action_type": action.kind.name}
-
-        if action.kind == ActionType.ROLL:
-            if self.state.rolls_left <= 0:
-                raise ValueError("No rolls left!")
-            self.roll_dice(np.zeros(5, dtype=bool))
-            info["dice_rolled"] = True
-
-        elif action.kind == ActionType.HOLD:
-            if self.state.rolls_left <= 0:
-                raise ValueError("No rolls left!")
-            if not np.any(self.state.current_dice):
-                raise ValueError("Cannot hold empty dice!")
-            self.roll_dice(action.data)
-            info["dice_held"] = np.where(action.data)[0].tolist()
-
-        elif action.kind == ActionType.SCORE:
-            category = action.data
-            if self.state.score_sheet[category] is not None:
-                raise ValueError(f"Category {category} already filled!")
-            if not np.any(self.state.current_dice):
-                raise ValueError("Cannot score empty dice!")
-
-            # Score the category
-            points = self.calc_score(category, self.state.current_dice)
-
-            # Use shaped reward
-            shaped_reward = self.calc_strategic_reward(category, points)
-            reward = float(shaped_reward)
-
-            self.state.score_sheet[category] = points
-            info["category_scored"] = category.name
-            info["points_scored"] = points
-
-            # Check if game is over (all categories filled)
-            if all(score is not None for score in self.state.score_sheet.values()):
-                done = True
-                bonus = self.calc_upper_bonus()
-                reward += bonus  # reward for finishing with upper bonus
-                info["upper_bonus"] = bonus
-                info["final_score"] = (
-                    sum(
-                        score
-                        for score in self.state.score_sheet.values()
-                        if score is not None
-                    )
-                    + bonus
-                )
-
-            # Reset for next turn
-            self.state.current_dice = np.zeros(5, dtype=int)
-            self.state.rolls_left = 3
-
-        return self.state, reward, done, info
-
-    def render(self) -> str:
-        """Render game state as string."""
-        lines = []
-
-        # Format dice display
+    def render(self, mode: str = "human") -> Optional[str]:
+        """
+        Renders the current game state. If mode="human", prints to stdout.
+        Return a string if needed for "ansi" or debugging.
+        """
         dice_vals = self.state.current_dice
         dice_str = " ".join(str(d) if d > 0 else "-" for d in dice_vals)
         rolls = self.state.rolls_left
+
+        lines = []
         lines.append(f"Dice: [{dice_str}] (rolls left: {rolls})")
 
-        # Score sheet
         lines.append("\nScore sheet:")
         for cat in YahtzeeCategory:
-            score = self.state.score_sheet[cat]
-            lines.append(f"{cat.name}: {score if score is not None else '-'}")
+            sc = self.state.score_sheet[cat]
+            sc_str = str(sc) if sc is not None else "-"
+            lines.append(f"{cat.name}: {sc_str}")
 
         bonus = self.calc_upper_bonus()
         if bonus > 0:
             lines.append(f"\nUpper Bonus: +{bonus}")
 
-        return "\n".join(lines)
+        text = "\n".join(lines)
+
+        if mode == "human":
+            print(text)
+            return None
+        else:
+            return text
+
+    def close(self):
+        pass

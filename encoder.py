@@ -1,8 +1,14 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from env import Action, YahtzeeCategory
+from yahtzee_types import Action, ActionType, GameState, YahtzeeCategory
+
+# Action mapping constants
+NUM_ACTIONS = 46  # 1 ROLL + 32 HOLD + 13 SCORE
+ALL_ACTIONS = []  # Will be populated in ActionMapper
+ACTION_TO_IDX = {}  # Will be populated in ActionMapper
+IDX_TO_ACTION = {}  # Will be populated in ActionMapper
 
 
 class StateEncoder:
@@ -12,7 +18,7 @@ class StateEncoder:
         self.categories = list(YahtzeeCategory)
         self.num_categories = len(self.categories)
         self.use_opponent_value = use_opponent_value
-        
+
         # Pre-compute category indices for faster lookup
         self.upper_cats = [
             YahtzeeCategory.ONES,
@@ -22,7 +28,7 @@ class StateEncoder:
             YahtzeeCategory.FIVES,
             YahtzeeCategory.SIXES,
         ]
-        
+
         # Calculate state size based on feature set
         self.state_size = (
             1  # Number of rerolls left
@@ -31,7 +37,7 @@ class StateEncoder:
             + 2  # Player upper and lower scores
             + (1 if use_opponent_value else 0)  # Opponent value (optional)
         )
-        
+
         # Validate state size matches expected dimensions
         expected_size = 22 if not use_opponent_value else 23
         if self.state_size != expected_size:
@@ -43,19 +49,21 @@ class StateEncoder:
         """Get counts of each dice value (1-6)."""
         return np.bincount(dice, minlength=7)[1:]  # Skip index 0
 
-    def _get_score_summary(self, scores: Dict[YahtzeeCategory, int]) -> Tuple[float, float]:
+    def _get_score_summary(
+        self, scores: Dict[YahtzeeCategory, Optional[int]]
+    ) -> Tuple[float, float]:
         """Calculate normalized upper and lower section scores."""
         upper_score = sum(scores[cat] or 0 for cat in self.upper_cats)
         lower_score = sum(
-            scores[cat] or 0 
-            for cat in self.categories 
-            if cat not in self.upper_cats
+            scores[cat] or 0 for cat in self.categories if cat not in self.upper_cats
         )
-        
+
         # Normalize scores
         upper_score = min(upper_score / 63.0, 1.0)  # 63 is bonus threshold
-        lower_score = min(lower_score / 200.0, 1.0)  # 200 is approximate max lower score
-        
+        lower_score = min(
+            lower_score / 200.0, 1.0
+        )  # 200 is approximate max lower score
+
         return upper_score, lower_score
 
     def encode(self, state, opponent_value: float = 0.0) -> np.ndarray:
@@ -95,21 +103,76 @@ class ActionMapper:
     """Maps between actions and indices."""
 
     def __init__(self):
-        from env import ACTION_TO_IDX, ALL_ACTIONS, IDX_TO_ACTION
+        # Generate all possible actions
+        self.hold_masks = []
+        for bits in range(32):
+            mask = [(bits & (1 << i)) != 0 for i in range(5)]
+            self.hold_masks.append(np.array(mask, dtype=bool))
 
-        self.actions = ALL_ACTIONS
+        # Clear global mappings
+        global ALL_ACTIONS, ACTION_TO_IDX, IDX_TO_ACTION
+        ALL_ACTIONS.clear()
+        ACTION_TO_IDX.clear()
+        IDX_TO_ACTION.clear()
+
+        # ROLL action
+        ALL_ACTIONS.append(Action(ActionType.ROLL))
+
+        # HOLD actions
+        for mask in self.hold_masks:
+            hold_action = Action(ActionType.HOLD, tuple(mask))
+            ALL_ACTIONS.append(hold_action)
+
+        # SCORE actions
+        for cat in YahtzeeCategory:
+            ALL_ACTIONS.append(Action(ActionType.SCORE, cat))
+
+        # Build action maps
+        for i, act in enumerate(ALL_ACTIONS):
+            ACTION_TO_IDX[act] = i
+            IDX_TO_ACTION[i] = act
+
         self.action_size = len(ALL_ACTIONS)
-        self.action_to_idx = ACTION_TO_IDX
-        self.idx_to_action = IDX_TO_ACTION
 
     def action_to_index(self, action: Action) -> int:
-        return self.action_to_idx[action]
+        """Convert Action to index."""
+        return ACTION_TO_IDX[action]
 
     def index_to_action(self, index: int) -> Action:
-        return self.idx_to_action[index]
+        """Convert index to Action."""
+        return IDX_TO_ACTION[index]
 
     def valid_action_mask(self, valid_actions: List[int]) -> np.ndarray:
         """Create binary mask for valid actions."""
         mask = np.zeros(self.action_size, dtype=np.float32)
         mask[valid_actions] = 1.0
         return mask
+
+    def get_valid_actions(self, state: GameState) -> List[int]:
+        """Get list of valid action indices for current state."""
+        valid = []
+        has_rolls = state.rolls_left > 0
+        not_finished = None in state.score_sheet.values()
+
+        if has_rolls and not_finished:
+            # If showing no dice, can only ROLL
+            if not np.any(state.current_dice):
+                roll_idx = ACTION_TO_IDX[Action(ActionType.ROLL)]
+                valid.append(roll_idx)
+            else:
+                # can do ROLL or HOLD combos
+                roll_idx = ACTION_TO_IDX[Action(ActionType.ROLL)]
+                valid.append(roll_idx)
+                for mask in self.hold_masks:
+                    if np.any(mask):
+                        hold_act = Action(ActionType.HOLD, tuple(mask))
+                        valid.append(ACTION_TO_IDX[hold_act])
+
+        # can score if dice are showing
+        if np.any(state.current_dice):
+            for cat in YahtzeeCategory:
+                if state.score_sheet[cat] is None:
+                    score_act = Action(ActionType.SCORE, cat)
+                    valid.append(ACTION_TO_IDX[score_act])
+
+        return valid
