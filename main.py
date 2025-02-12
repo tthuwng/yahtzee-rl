@@ -186,7 +186,7 @@ def train(
     checkpoint_freq: int = 100,
     eval_freq: int = 50,
     num_eval_episodes: int = 50,
-    min_improvement: float = 0.5,
+    min_improvement: float = 1.0,  # Slightly larger gap to confirm improvement
     objective: str = "win",
 ) -> None:
     """Train DQN agent with parallel environments and batch processing."""
@@ -222,9 +222,9 @@ def train(
     agent = YahtzeeAgent(
         state_size=encoders[0].state_size,
         action_size=NUM_ACTIONS,
-        batch_size=1024,  # reduced from 2048
+        batch_size=1024,  # keep some parallelism, but not huge
         gamma=0.99,
-        learning_rate=3e-4,
+        learning_rate=3e-4,  # keep a moderate LR
         target_update=50,
         device=device,
         min_epsilon=0.02,
@@ -493,21 +493,21 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
             print("\nAgent's decision:")
             if action.kind == ActionType.ROLL:
                 print("Action: ROLL all dice")
-            elif action.kind == ActionType.HOLD_MASK:
+            elif action.kind == ActionType.HOLD:
                 held = [i + 1 for i, hold in enumerate(action.data) if hold]
-                print(f"Action: Hold dice at positions {held}")
+                if held:
+                    print(f"Action: Hold dice at positions {held}")
+                else:
+                    print("Action: ROLL all dice")
             else:
                 points = env.calc_score(action.data, state.current_dice)
                 print(f"Action: Score {action.data.name} for {points} points")
 
         state, reward, done, _ = env.step(action_idx)
-
-        if render:
-            if action.kind == ActionType.SCORE:
-                points = env.calc_score(action.data, state.current_dice)
-                print(f"Scored {points} points")
-                turn += 1
-            time.sleep(1)
+        if render and action.kind == ActionType.SCORE:
+            points = env.calc_score(action.data, state.current_dice)
+            print(f"Scored {points} points")
+            turn += 1
 
     # Calculate final actual score
     upper_total = sum(state.score_sheet[cat] or 0 for cat in [
@@ -565,18 +565,19 @@ def show_action_values(
     valid_q.sort(key=lambda x: x[1], reverse=True)
 
     print("\nTop Actions and Their Expected Values:")
-    for i, (action_idx, value) in enumerate(valid_q[:num_top]):
+    for i, (action_idx, value) in enumerate(valid_q[:num_top], 1):
         action = env.IDX_TO_ACTION[action_idx]
         if action.kind == ActionType.ROLL:
-            print(f"{i + 1}. ROLL all dice (EV: {value:.1f})")
-        elif action.kind == ActionType.HOLD_MASK:
+            print(f"{i}. ROLL all dice (EV: {value:.1f})")
+        elif action.kind == ActionType.HOLD:
             held = [i + 1 for i, hold in enumerate(action.data) if hold]
             if held:
-                print(f"{i + 1}. Hold dice {held} (EV: {value:.1f})")
+                print(f"{i}. Hold dice {held} (EV: {value:.1f})")
             else:
-                print(f"{i + 1}. ROLL all dice (EV: {value:.1f})")
+                print(f"{i}. ROLL all dice (EV: {value:.1f})")
         else:
-            print(f"{i + 1}. Score {action.data.name} (EV: {value:.1f})")
+            points = env.calc_score(action.data, state.current_dice)
+            print(f"{i}. Score {action.data.name} for {points} points (EV: {value:.1f})")
 
     return state, valid_q[:num_top]
 

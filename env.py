@@ -84,7 +84,9 @@ class YahtzeeEnv:
         self.all_actions.append(Action(ActionType.ROLL))
         # Hold actions
         for mask in self.hold_masks:
-            self.all_actions.append(Action(ActionType.HOLD, mask))
+            # Convert numpy array to tuple for proper hashing
+            hold_action = Action(ActionType.HOLD, tuple(mask))
+            self.all_actions.append(hold_action)
         # Score actions
         for cat in YahtzeeCategory:
             self.all_actions.append(Action(ActionType.SCORE, cat))
@@ -132,7 +134,9 @@ class YahtzeeEnv:
                 valid.append(self.action_to_idx[Action(ActionType.ROLL)])
                 for mask in self.hold_masks:
                     if np.any(mask):  # Only add if actually holding dice
-                        valid.append(self.action_to_idx[Action(ActionType.HOLD, mask)])
+                        # Convert numpy array to tuple for proper hashing
+                        hold_action = Action(ActionType.HOLD, tuple(mask))
+                        valid.append(self.action_to_idx[hold_action])
 
         # Can score if:
         # 1. Category is not filled
@@ -220,18 +224,19 @@ class YahtzeeEnv:
         )
         return 35 if upper_score >= 63 else 0
 
-    def calc_strategic_reward(self, category: YahtzeeCategory, base_score: float) -> float:
+    def calc_strategic_reward(
+        self, category: YahtzeeCategory, base_score: float
+    ) -> float:
         """
         Calculate a 'shaped' reward for scoring, encouraging better Yahtzee tactics:
-        - Increased penalty for zeros
-        - Larger bonuses for bigger combos
-        - More emphasis on aiming for upper bonus
+        - Strong baseline reward if >0 points
+        - Larger negative penalty for scoring 0, especially on big categories
+        - Slightly more emphasis on upper bonus
         """
         dice = self.state.current_dice
         counts = np.bincount(dice)[1:] if any(dice) else []
         max_count = max(counts) if any(counts) else 0
 
-        # track upper section
         upper_cats = [
             YahtzeeCategory.ONES,
             YahtzeeCategory.TWOS,
@@ -241,56 +246,62 @@ class YahtzeeEnv:
             YahtzeeCategory.SIXES,
         ]
         upper_score_so_far = sum(self.state.score_sheet[cat] or 0 for cat in upper_cats)
-        upper_filled = sum(1 for cat in upper_cats if self.state.score_sheet[cat] is not None)
+        upper_filled = sum(
+            1 for cat in upper_cats if self.state.score_sheet[cat] is not None
+        )
 
         bonus_reward = 0.0
 
-        # Slight baseline for any valid scoring move
-        bonus_reward += 2.0
+        # Give a small baseline if we actually score > 0
+        if base_score > 0:
+            bonus_reward += 2.0
+        else:
+            # Larger penalty for scoring zero
+            bonus_reward -= 8.0
 
-        # encourage big combos (increased from previous values)
+        # Encourage big combos
         if (
             max_count >= 4
             and self.state.score_sheet.get(YahtzeeCategory.YAHTZEE) is None
         ):
-            bonus_reward += 10.0  # was 8
+            bonus_reward += 10.0
         elif max_count >= 3:
-            bonus_reward += 4.0  # was 3
+            bonus_reward += 4.0
 
-        # More emphasis on upper section progression
+        # Emphasize upper category progression
         if category in upper_cats:
             val_index = upper_cats.index(category)
             val = val_index + 1
-            # If we get at least 3-of-a-kind for the category
+            # If we get at least 3-of-a-kind for the chosen face
             if base_score >= val * 3:
                 bonus_reward += 7.0
             else:
-                bonus_reward += 2.0  # minor for anything in that category
+                bonus_reward += 2.0  # minor reward for filling that category anyway
 
-            # Scale bigger face categories slightly
+            # Slightly scale bigger faces
             bonus_reward += val * 0.3
 
-            # If close to 63 early, bigger push
+            # If close to 63 early
             if (upper_score_so_far + base_score) >= 63 and upper_filled < 5:
                 bonus_reward += 6.0
 
         # Reward special combos
         if category == YahtzeeCategory.FULL_HOUSE and base_score == 25:
-            bonus_reward += 5.0  # was 4
+            bonus_reward += 5.0
         elif category == YahtzeeCategory.SMALL_STRAIGHT and base_score == 30:
-            bonus_reward += 6.0  # was 5
+            bonus_reward += 6.0
         elif category == YahtzeeCategory.LARGE_STRAIGHT and base_score == 40:
-            bonus_reward += 8.0  # was 6
+            bonus_reward += 8.0
         elif category == YahtzeeCategory.YAHTZEE and base_score == 50:
-            bonus_reward += 15.0  # was 10
+            bonus_reward += 15.0
 
-        # Stronger penalties for zeroing out high-potential categories
-        if base_score == 0:
-            # If it's CHANCE and we got 0, likely we had no dice, punish heavily
-            if category == YahtzeeCategory.CHANCE:
-                bonus_reward -= 12.0  # was 10
-            else:
-                bonus_reward -= 6.0   # was 4
+        # If we scored 0 on big combos, penalize further
+        if base_score == 0 and category in [
+            YahtzeeCategory.FULL_HOUSE,
+            YahtzeeCategory.LARGE_STRAIGHT,
+            YahtzeeCategory.YAHTZEE,
+        ]:
+            bonus_reward -= 5.0  # extra penalty on top of baseline -8
 
         return base_score + bonus_reward
 
