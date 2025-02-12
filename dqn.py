@@ -1,6 +1,6 @@
 import random
 from collections import namedtuple, deque
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -14,7 +14,7 @@ Transition = namedtuple(
 
 
 class DQN(nn.Module):
-    """Enhanced DQN with higher capacity and additional residual block."""
+    """Enhanced DQN with residual blocks."""
 
     def __init__(self, state_size: int, action_size: int) -> None:
         super().__init__()
@@ -23,8 +23,8 @@ class DQN(nn.Module):
         self.state_size = state_size
         self.action_size = action_size
 
-        # Increase hidden dim from 512 to 768, reduce dropout from 0.05 to 0.02
-        hidden_dim = 768
+        # Use 512 hidden dim to match saved model
+        hidden_dim = 512
         dropout_rate = 0.02
 
         # Feature extraction layers
@@ -35,7 +35,7 @@ class DQN(nn.Module):
             nn.Dropout(dropout_rate),
         )
 
-        # Residual blocks (3 total now)
+        # Residual blocks (2 total to match saved model)
         self.res_blocks = nn.ModuleList(
             [
                 nn.Sequential(
@@ -48,25 +48,25 @@ class DQN(nn.Module):
                     nn.LayerNorm(hidden_dim),
                     nn.Dropout(dropout_rate),
                 )
-                for _ in range(3)
+                for _ in range(2)
             ]
         )
 
         # Dueling architecture
         self.value_stream = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 3),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.LayerNorm(hidden_dim // 3),
+            nn.LayerNorm(hidden_dim // 2),
             nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim // 3, 1),
+            nn.Linear(hidden_dim // 2, 1),
         )
 
         self.advantage_stream = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 3),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.LayerNorm(hidden_dim // 3),
+            nn.LayerNorm(hidden_dim // 2),
             nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim // 3, action_size),
+            nn.Linear(hidden_dim // 2, action_size),
         )
 
         # Initialize weights
@@ -200,6 +200,7 @@ class YahtzeeAgent:
         self.learn_steps = 0
         self.training_mode = True
         self.n_step = n_step
+        self.latest_loss: Optional[float] = None
 
         # N-step storage: for each environment we'll keep a short queue of (state,action,...) until we can pop it.
         # key = env index, value = deque of partial transitions
@@ -357,6 +358,7 @@ class YahtzeeAgent:
 
         # We can only learn if there's enough data
         if len(self.buffer) < self.batch_size:
+            self.latest_loss = None
             return 0.0
 
         # Sample from replay buffer
@@ -393,8 +395,9 @@ class YahtzeeAgent:
 
         self.scheduler.step()
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
-        return loss.item()
+        
+        self.latest_loss = loss.item()
+        return self.latest_loss
 
     @torch.no_grad()
     def get_q_values(self, state_vec: np.ndarray) -> np.ndarray:

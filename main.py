@@ -247,6 +247,7 @@ def train(
     )
 
     start_episode = 0
+    final_episode = start_episode
     metrics = {
         "best_eval_score": float("-inf"),
         "episode_rewards": [],
@@ -256,6 +257,7 @@ def train(
 
     if checkpoint_path:
         start_episode = load_checkpoint(checkpoint_path, agent, device)
+        final_episode = start_episode
         checkpoint_loaded = torch.load(checkpoint_path, map_location=device)
         metrics.update(checkpoint_loaded.get("metrics", {}))
 
@@ -264,6 +266,7 @@ def train(
 
     try:
         for episode in progress:
+            final_episode = episode
             episode_rewards = []
             episode_losses = []
             actual_scores = []
@@ -315,25 +318,38 @@ def train(
                     new_dones,
                     env_indices=active_indices
                 )
+                
+                # Track the loss from the training step
+                if agent.latest_loss is not None:
+                    episode_losses.append(agent.latest_loss)
 
             episode_rewards.extend(total_rewards)
             metrics["episode_rewards"].extend(episode_rewards)
+            if episode_losses:
+                metrics["losses"].extend(episode_losses)
+                mean_loss = np.mean(episode_losses)
+            else:
+                mean_loss = 0.0
 
             mean_reward = np.mean(episode_rewards)
-            mean_loss = 0.0
             mean_actual_score = np.mean(actual_scores) if actual_scores else None
 
-            wandb.log(
-                {
-                    "episode": episode,
-                    "reward": mean_reward,
-                    "actual_score": mean_actual_score,
-                    "epsilon": agent.epsilon,
-                    "loss": mean_loss,
-                    "learning_rate": agent.optimizer.param_groups[0]["lr"],
-                },
-                step=episode,
-            )
+            # Log training metrics
+            log_dict = {
+                "episode": episode,
+                "reward": mean_reward,
+                "epsilon": agent.epsilon,
+                "learning_rate": agent.optimizer.param_groups[0]["lr"],
+                "buffer_size": len(agent.buffer),
+            }
+            
+            if agent.latest_loss is not None:
+                log_dict["loss"] = agent.latest_loss
+            
+            if mean_actual_score is not None:
+                log_dict["actual_score"] = mean_actual_score
+
+            wandb.log(log_dict, step=episode)
 
             if len(metrics["episode_rewards"]) >= 100:
                 mean_100 = np.mean(metrics["episode_rewards"][-100:])
@@ -342,10 +358,12 @@ def train(
                     {
                         "Mean100": f"{mean_100:.1f}",
                         "Best": f"{best_score:.1f}",
+                        "Buffer": f"{len(agent.buffer)}",
+                        "Loss": f"{mean_loss:.3f}" if mean_loss > 0 else "N/A",
                     }
                 )
 
-            if (episode + 1) % eval_freq == 0:
+            if (episode + 1) % eval_freq == 0 and len(agent.buffer) >= agent.batch_size:
                 eval_stats = evaluate_agent(agent, num_eval_episodes, objective)
                 mean_eval_score = eval_stats["actual_score"]["mean"]
                 mean_eval_reward = eval_stats["training_reward"]["mean"]
@@ -377,8 +395,10 @@ def train(
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
+        final_episode = episode if 'episode' in locals() else start_episode
     except Exception as e:
         print(f"\nError during training: {str(e)}")
+        final_episode = episode if 'episode' in locals() else start_episode
         raise
     finally:
         try:
@@ -389,7 +409,7 @@ def train(
                 if len(metrics["episode_rewards"]) >= 100
                 else np.mean(metrics["episode_rewards"]),
             }
-            filename = save_checkpoint(agent, episode + 1, run_id, final_metrics)
+            filename = save_checkpoint(agent, final_episode + 1, run_id, final_metrics)
             print(f"Final model saved to: {filename}")
         except Exception as e:
             print(f"Error saving final model: {str(e)}")

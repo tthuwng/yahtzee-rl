@@ -9,16 +9,16 @@ import glob
 import time
 
 from play import load_agent, simulate_game, show_action_values, evaluate_performance
-from env import YahtzeeEnv, YahtzeeCategory, GameState, IDX_TO_ACTION, ActionType, NUM_ACTIONS
-from encoder import StateEncoder
+from env import YahtzeeEnv, YahtzeeCategory, GameState, ActionType
+from encoder import IDX_TO_ACTION, NUM_ACTIONS, StateEncoder
 from dqn import YahtzeeAgent
 
 # Global variables to maintain state
 agent = None
 current_state: Optional[GameState] = None
 env = YahtzeeEnv()
-encoder = StateEncoder(use_opponent_value=True)
-current_objective = "win"  # Add global objective state
+current_objective = "avg_score"  # Default to avg_score mode
+encoder = StateEncoder(use_opponent_value=False)  # Initialize encoder without opponent value
 
 def get_available_models() -> List[str]:
     """Get list of available model files in models directory."""
@@ -133,10 +133,10 @@ def format_combinations(dice_values: np.ndarray) -> str:
 
 def load_model(model_path: str) -> Tuple[str, None]:
     """Load a model from the specified path."""
-    global agent, current_objective
+    global agent, current_objective, encoder
     
     try:
-        # Create encoder instance to get state size
+        # Update encoder based on objective
         encoder = StateEncoder(use_opponent_value=(current_objective == "win"))
         
         # Initialize agent with correct parameters

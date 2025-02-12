@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+import random
 from typing import Optional, Tuple, List
 
 import numpy as np
@@ -10,8 +11,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from dqn import YahtzeeAgent
-from encoder import StateEncoder
-from env import IDX_TO_ACTION, NUM_ACTIONS, ActionType, GameState, YahtzeeEnv, YahtzeeCategory
+from encoder import IDX_TO_ACTION, NUM_ACTIONS, StateEncoder
+from env import ActionType, GameState, YahtzeeEnv, YahtzeeCategory, RewardStrategy
 
 
 def list_available_models(models_dir: str = "models") -> List[str]:
