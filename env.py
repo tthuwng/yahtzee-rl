@@ -165,40 +165,33 @@ class YahtzeeEnv:
         elif category == YahtzeeCategory.SIXES:
             return counts[5] * 6
         elif category == YahtzeeCategory.THREE_OF_A_KIND:
-            # Find the first value that appears 3 or more times
             for val, count in enumerate(counts, 1):
                 if count >= 3:
-                    return dice.sum()  # Score sum of all dice
+                    return dice.sum()
             return 0
         elif category == YahtzeeCategory.FOUR_OF_A_KIND:
-            # Find the first value that appears 4 or more times
             for val, count in enumerate(counts, 1):
                 if count >= 4:
-                    return dice.sum()  # Score sum of all dice
+                    return dice.sum()
             return 0
         elif category == YahtzeeCategory.FULL_HOUSE:
-            # Need exactly 3 of one number and 2 of another
             has_three = False
             has_two = False
             three_val = None
-
             for val, count in enumerate(counts, 1):
                 if count == 3:
                     has_three = True
                     three_val = val
                 elif count == 2 and (not has_three or val != three_val):
                     has_two = True
-
             return 25 if has_three and has_two else 0
         elif category == YahtzeeCategory.SMALL_STRAIGHT:
-            # Check for sequences of 4 consecutive numbers
             sorted_unique = np.unique(dice)
             for straight in [[1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6]]:
                 if all(x in sorted_unique for x in straight):
                     return 30
             return 0
         elif category == YahtzeeCategory.LARGE_STRAIGHT:
-            # Check for sequences of 5 consecutive numbers
             sorted_unique = np.unique(dice)
             if len(sorted_unique) == 5 and (
                 all(x in sorted_unique for x in [1, 2, 3, 4, 5])
@@ -207,7 +200,6 @@ class YahtzeeEnv:
                 return 40
             return 0
         elif category == YahtzeeCategory.YAHTZEE:
-            # All five dice showing the same face
             return 50 if np.any(counts == 5) else 0
         elif category == YahtzeeCategory.CHANCE:
             return dice.sum()
@@ -228,6 +220,85 @@ class YahtzeeEnv:
             ]
         )
         return 35 if upper_score >= 63 else 0
+
+    def calc_strategic_reward(
+        self, category: YahtzeeCategory, base_score: float
+    ) -> float:
+        """
+        Calculate a 'shaped' reward for scoring, encouraging good Yahtzee tactics:
+        - Weighted bonuses for heading toward upper bonus or big combos
+        - Penalties for zeros in certain categories
+        """
+        dice = self.state.current_dice
+        counts = np.bincount(dice)[1:] if any(dice) else []
+        max_count = max(counts) if any(counts) else 0
+        unique_vals = np.unique(dice[dice > 0]) if any(dice) else []
+
+        # track upper section
+        upper_cats = [
+            YahtzeeCategory.ONES,
+            YahtzeeCategory.TWOS,
+            YahtzeeCategory.THREES,
+            YahtzeeCategory.FOURS,
+            YahtzeeCategory.FIVES,
+            YahtzeeCategory.SIXES,
+        ]
+        upper_score_so_far = sum(self.state.score_sheet[cat] or 0 for cat in upper_cats)
+        upper_filled = sum(
+            1 for cat in upper_cats if self.state.score_sheet[cat] is not None
+        )
+
+        # baseline is actual points scored
+        bonus_reward = 0.0
+
+        # small baseline to reward any play
+        bonus_reward += 2.0
+
+        # encourage big combos
+        if (
+            max_count >= 4
+            and self.state.score_sheet.get(YahtzeeCategory.YAHTZEE) is None
+        ):
+            bonus_reward += 8.0
+        elif max_count >= 3:
+            bonus_reward += 3.0
+
+        # partial reward for going after the upper bonus
+        if category in upper_cats:
+            # ideally we want 3 or more of a kind to keep pace
+            val_index = upper_cats.index(category)
+            val = val_index + 1
+            if base_score >= val * 3:
+                bonus_reward += 5.0
+            else:
+                bonus_reward += 1.0  # any progress is decent
+
+            # small scaling for higher face categories
+            bonus_reward += val * 0.2
+
+            # if close to hitting 63 early, bigger push
+            if (upper_score_so_far + base_score) >= 63 and upper_filled < 5:
+                bonus_reward += 4.0
+
+        # reward full house, straights
+        if category == YahtzeeCategory.FULL_HOUSE and base_score == 25:
+            bonus_reward += 4.0
+        elif category == YahtzeeCategory.SMALL_STRAIGHT and base_score == 30:
+            bonus_reward += 5.0
+        elif category == YahtzeeCategory.LARGE_STRAIGHT and base_score == 40:
+            bonus_reward += 6.0
+        elif category == YahtzeeCategory.YAHTZEE and base_score == 50:
+            bonus_reward += 10.0
+
+        # penalize zeroing out potentially valuable categories
+        if base_score == 0:
+            if category == YahtzeeCategory.CHANCE:
+                bonus_reward -= 10.0
+            else:
+                bonus_reward -= 4.0
+
+        # final combined reward
+        return base_score + bonus_reward
 
     def step(self, action_idx: int) -> Tuple[GameState, float, bool, dict]:
         """Take action and return (next_state, reward, done, info)."""
@@ -262,8 +333,12 @@ class YahtzeeEnv:
 
             # Score the category
             points = self.calc_score(category, self.state.current_dice)
+
+            # Use shaped reward
+            shaped_reward = self.calc_strategic_reward(category, points)
+            reward = float(shaped_reward)
+
             self.state.score_sheet[category] = points
-            reward = float(points)
             info["category_scored"] = category.name
             info["points_scored"] = points
 
@@ -271,7 +346,7 @@ class YahtzeeEnv:
             if all(score is not None for score in self.state.score_sheet.values()):
                 done = True
                 bonus = self.calc_upper_bonus()
-                reward += bonus
+                reward += bonus  # reward for finishing with upper bonus
                 info["upper_bonus"] = bonus
                 info["final_score"] = (
                     sum(
@@ -304,7 +379,6 @@ class YahtzeeEnv:
             score = self.state.score_sheet[cat]
             lines.append(f"{cat.name}: {score if score is not None else '-'}")
 
-        # Upper section bonus
         bonus = self.calc_upper_bonus()
         if bonus > 0:
             lines.append(f"\nUpper Bonus: +{bonus}")

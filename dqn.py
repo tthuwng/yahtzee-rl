@@ -29,7 +29,7 @@ class DQN(nn.Module):
             nn.Linear(state_size, 512),
             nn.ReLU(),
             nn.LayerNorm(512),
-            nn.Dropout(0.1)
+            nn.Dropout(0.05)  # reduced from 0.1
         )
         
         # Residual blocks for better feature learning
@@ -38,11 +38,11 @@ class DQN(nn.Module):
                 nn.Linear(512, 512),
                 nn.ReLU(),
                 nn.LayerNorm(512),
-                nn.Dropout(0.1),
+                nn.Dropout(0.05),  # reduced from 0.1
                 nn.Linear(512, 512),
                 nn.ReLU(),
                 nn.LayerNorm(512),
-                nn.Dropout(0.1)
+                nn.Dropout(0.05)  # reduced from 0.1
             ) for _ in range(2)
         ])
         
@@ -51,7 +51,7 @@ class DQN(nn.Module):
             nn.Linear(512, 256),
             nn.ReLU(),
             nn.LayerNorm(256),
-            nn.Dropout(0.1),
+            nn.Dropout(0.05),  # reduced from 0.1
             nn.Linear(256, 1)
         )
         
@@ -59,7 +59,7 @@ class DQN(nn.Module):
             nn.Linear(512, 256),
             nn.ReLU(),
             nn.LayerNorm(256),
-            nn.Dropout(0.1),
+            nn.Dropout(0.05),  # reduced from 0.1
             nn.Linear(256, action_size)
         )
         
