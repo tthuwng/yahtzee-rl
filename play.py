@@ -124,7 +124,7 @@ def convert_legacy_model(legacy_state: dict, state_size: int, action_size: int, 
         raise Exception("Unrecognized model format")
 
 
-def load_agent(model_path: Optional[str] = None) -> YahtzeeAgent:
+def load_agent(model_path: Optional[str] = None, objective: str = "win") -> YahtzeeAgent:
     """Load a trained agent from a model file."""
     if model_path is None:
         model_path = select_model()
@@ -132,8 +132,8 @@ def load_agent(model_path: Optional[str] = None) -> YahtzeeAgent:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Initialize encoder with use_opponent_value=True to match saved model
-    encoder = StateEncoder(use_opponent_value=True)
+    # Initialize encoder based on objective
+    encoder = StateEncoder(use_opponent_value=(objective == "win"))
     agent = YahtzeeAgent(
         state_size=encoder.state_size,
         action_size=NUM_ACTIONS,
@@ -152,10 +152,13 @@ def load_agent(model_path: Optional[str] = None) -> YahtzeeAgent:
     return agent
 
 
-def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> float:
-    """Run a full game simulation with visualization."""
+def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> Tuple[float, float]:
+    """
+    Run a full game simulation with visualization.
+    Returns (actual_score, training_reward)
+    """
     env = YahtzeeEnv()
-    encoder = StateEncoder(use_opponent_value=True)
+    encoder = StateEncoder(use_opponent_value=True)  # Set to True to match training
     state = env.reset()
     total_reward = 0
     done = False
@@ -163,188 +166,106 @@ def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> float:
 
     # Store original epsilon and set to minimum for deterministic play
     old_eps = agent.epsilon
-    agent.epsilon = 0.02
+    agent.epsilon = 0.02  # Match training evaluation epsilon
 
     while not done:
+        # Calculate actual game score for display
+        upper_total = sum(state.score_sheet[cat] or 0 for cat in [
+            YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
+            YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
+        ])
+        bonus = 35 if upper_total >= 63 else 0
+        lower_total = sum(state.score_sheet[cat] or 0 for cat in [
+            YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
+            YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
+            YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
+            YahtzeeCategory.CHANCE
+        ])
+        actual_score = upper_total + bonus + lower_total
+        
         clear_output(wait=True)
-        print(f"\n=== Turn {turn} | Score: {total_reward:.0f} ===")
-        
-        # Show dice state
-        dice_values = state.current_dice
-        dice_str = " ".join(f"[{d}]" if d > 0 else "[ ]" for d in dice_values)
-        print(f"\nDice (Rolls Left: {state.rolls_left})")
-        print(f"Positions: [1] [2] [3] [4] [5]")
-        print(f"Values:   {dice_str}")
-        
-        # Show score board
-        print("\nScore Board:")
-        print("─" * 20)
-        print(f"{'Category':<12} Score")
-        print("─" * 20)
-        
-        # Upper section
-        for cat in [YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
-                   YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES]:
-            score = state.score_sheet[cat]
-            print(f"{cat.name:<12} {score if score is not None else '-':>5}")
-        
-        # Calculate upper section total and bonus
-        upper_total = sum(state.score_sheet[cat] or 0 for cat in list(env.state.score_sheet.keys())[:6])
-        bonus = env.calc_upper_bonus()
-        print("─" * 20)
-        print(f"{'Sum':<12} {upper_total:>5}")
-        print(f"{'Bonus':<12} {bonus:>5}")
-        print("─" * 20)
-        
-        # Lower section
-        for cat in [YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
-                   YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
-                   YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
-                   YahtzeeCategory.CHANCE]:
-            score = state.score_sheet[cat]
-            print(f"{cat.name:<12} {score if score is not None else '-':>5}")
-        
-        # Show total
-        print("─" * 20)
-        print(f"{'TOTAL':<12} {total_reward:>5.0f}")
-        
-        # Show current combinations if any dice showing
-        if any(dice_values):
-            counts = np.bincount(dice_values)[1:] if any(dice_values) else []
-            combinations = []
-            if any(c >= 3 for c in counts):
-                val = next(i+1 for i, c in enumerate(counts) if c >= 3)
-                combinations.append(f"Three of a Kind ({val}s)")
-            if any(c >= 4 for c in counts):
-                val = next(i+1 for i, c in enumerate(counts) if c >= 4)
-                combinations.append(f"Four of a Kind ({val}s)")
-            if any(c == 5 for c in counts):
-                val = next(i+1 for i, c in enumerate(counts) if c == 5)
-                combinations.append(f"Yahtzee! ({val}s)")
-            if any(c == 3 for c in counts) and any(c == 2 for c in counts):
-                three_val = next(i+1 for i, c in enumerate(counts) if c == 3)
-                two_val = next(i+1 for i, c in enumerate(counts) if c == 2)
-                combinations.append(f"Full House ({three_val}s over {two_val}s)")
-            sorted_unique = np.unique(dice_values)
-            for straight in [[1,2,3,4], [2,3,4,5], [3,4,5,6]]:
-                if all(x in sorted_unique for x in straight):
-                    combinations.append(f"Small Straight ({'-'.join(map(str, straight))})")
-                    break
-            if len(sorted_unique) == 5 and (
-                all(x in sorted_unique for x in [1,2,3,4,5]) or
-                all(x in sorted_unique for x in [2,3,4,5,6])
-            ):
-                straight = [1,2,3,4,5] if sorted_unique[0] == 1 else [2,3,4,5,6]
-                combinations.append(f"Large Straight ({'-'.join(map(str, straight))})")
-            
-            if combinations:
-                print("\nPossible Combinations:")
-                for combo in combinations:
-                    print(f"• {combo}")
-                    
-        # Get agent's action
-        state_vec = encoder.encode(state)
+        print(f"\n=== Turn {turn} | Score: {actual_score} (Reward: {total_reward:.1f}) ===")
+        print(env.render())
+
+        state_vec = encoder.encode(state, opponent_value=0.5)  # Add opponent_value=0.5
         valid_actions = env.get_valid_actions()
         if not valid_actions:
             break
 
-        # Get Q-values and select best action
-        q_values = agent.get_q_values(state_vec)
-        q_values = q_values - total_reward  # Make values relative to current score
-        
-        # Apply action masking
-        mask = np.full(agent.action_size, float("-inf"))
-        mask[valid_actions] = 0
-        q_values = q_values + mask
-        
-        # Get top 3 actions
-        valid_q = [(i, q_values[i]) for i in valid_actions]
-        valid_q.sort(key=lambda x: x[1], reverse=True)
-        top_actions = valid_q[:3]
-        
-        # Show top actions
-        print("\nTop Actions:")
-        for i, (action_idx, value) in enumerate(top_actions, 1):
-            action = IDX_TO_ACTION[action_idx]
-            if action.kind == ActionType.ROLL:
-                print(f"{i}. Roll all dice (EV: {value:.1f})")
-            elif action.kind == ActionType.HOLD:
-                held = [i + 1 for i, hold in enumerate(action.data) if hold]
-                if held:
-                    held_values = [state.current_dice[i-1] for i in held]
-                    print(f"{i}. Hold {', '.join(f'{pos}({val})' for pos, val in zip(held, held_values))} (EV: {value:.1f})")
-            else:
-                points = env.calc_score(action.data, state.current_dice)
-                print(f"{i}. Score {action.data.name} for {points} points (EV: {value:.1f})")
-        
-        # Take best action
-        action_idx = top_actions[0][0]
+        action_idx = agent.select_action(state_vec, valid_actions)
         action = IDX_TO_ACTION[action_idx]
-        
-        # Show decision
-        print("\nAgent's Decision:")
+
+        print("\nAgent's decision:")
         if action.kind == ActionType.ROLL:
-            print("Rolling all dice")
+            print("Action: ROLL all dice")
         elif action.kind == ActionType.HOLD:
             held = [i + 1 for i, hold in enumerate(action.data) if hold]
             if held:
                 held_values = [state.current_dice[i-1] for i in held]
-                print(f"Holding: {', '.join(f'{pos}({val})' for pos, val in zip(held, held_values))}")
+                print(f"Action: Hold {', '.join(f'{pos}({val})' for pos, val in zip(held, held_values))}")
             else:
-                print("Rolling all dice")
+                print("Action: ROLL all dice")
         else:
             points = env.calc_score(action.data, state.current_dice)
-            print(f"Scoring {action.data.name} for {points} points")
+            print(f"Action: Score {action.data.name} for {points} points")
 
-        # Take action
         state, reward, done, _ = env.step(action_idx)
         total_reward += reward
-        
+
         if action.kind == ActionType.SCORE:
+            points = env.calc_score(action.data, state.current_dice)
+            print(f"Scored {points} points (Reward: {reward:.1f})")
             turn += 1
-            
         time.sleep(delay)
 
-    # Show final results
-    clear_output(wait=True)
-    print("\n=== Game Over ===")
-    
-    # Show final dice state
-    dice_str = " ".join(f"[{d}]" if d > 0 else "[ ]" for d in state.current_dice)
-    print(f"\nDice (Rolls Left: {state.rolls_left})")
-    print(f"Positions: [1] [2] [3] [4] [5]")
-    print(f"Values:   {dice_str}")
-    
-    # Calculate final scores
-    upper_scores = [state.score_sheet[cat] or 0 for cat in [
+    # Calculate final actual score
+    upper_total = sum(state.score_sheet[cat] or 0 for cat in [
         YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
         YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
-    ]]
-    upper_total = sum(upper_scores)
-    bonus = env.calc_upper_bonus()
-    lower_score = total_reward - upper_total - bonus
-    
-    print(f"\nFinal Score: {total_reward:.0f}")
-    print(f"• Upper Section: {upper_total}")
-    print(f"• Upper Bonus: {bonus}")
-    print(f"• Lower Section: {lower_score:.0f}")
+    ])
+    bonus = 35 if upper_total >= 63 else 0
+    lower_total = sum(state.score_sheet[cat] or 0 for cat in [
+        YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
+        YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
+        YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
+        YahtzeeCategory.CHANCE
+    ])
+    actual_score = upper_total + bonus + lower_total
+
+    clear_output(wait=True)
+    print("\n=== Game Over ===")
+    print(env.render())
+    print(f"\nFinal Results:")
+    print(f"• Actual Score: {actual_score}")
+    print(f"  - Upper Section: {upper_total}")
+    print(f"  - Upper Bonus: {bonus}")
+    print(f"  - Lower Section: {lower_total}")
+    print(f"• Training Reward: {total_reward:.1f}")
 
     agent.epsilon = old_eps
-    return total_reward
+    return actual_score, total_reward
 
 
 def show_action_values(
     agent: YahtzeeAgent, state: Optional[GameState] = None, num_top: int = 5
-) -> Tuple[GameState, list]:
-    """Show expected values for all valid actions in current state."""
+) -> tuple:
+    """
+    Show expected values for all valid actions in the current state.
+    If state is None, starts a new game.
+    Returns (state, valid_actions, q_values) for further use.
+    """
     env = YahtzeeEnv()
-    encoder = StateEncoder(use_opponent_value=True)
+    encoder = StateEncoder(use_opponent_value=True)  # Set to True to match training
 
     if state is None:
         state = env.reset()
 
     print("\nCurrent Game State:")
-    
+    print(env.render())
+
+    state_vec = encoder.encode(state, opponent_value=0.5)  # Add opponent_value=0.5
+    valid_actions = env.get_valid_actions()
+
     # Show dice state
     dice_values = state.current_dice
     dice_str = " ".join(f"[{d}]" if d > 0 else "[ ]" for d in dice_values)
@@ -359,36 +280,34 @@ def show_action_values(
     print("─" * 20)
     
     # Upper section
+    upper_total = 0
     for cat in [YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
                YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES]:
         score = state.score_sheet[cat]
+        upper_total += score if score is not None else 0
         print(f"{cat.name:<12} {score if score is not None else '-':>5}")
     
-    # Calculate upper section total and bonus
-    upper_total = sum(state.score_sheet[cat] or 0 for cat in list(env.state.score_sheet.keys())[:6])
-    bonus = env.calc_upper_bonus()
+    # Calculate upper section bonus
+    bonus = 35 if upper_total >= 63 else 0
     print("─" * 20)
     print(f"{'Sum':<12} {upper_total:>5}")
     print(f"{'Bonus':<12} {bonus:>5}")
     print("─" * 20)
     
     # Lower section
+    lower_total = 0
     for cat in [YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
                YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
                YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
                YahtzeeCategory.CHANCE]:
         score = state.score_sheet[cat]
+        lower_total += score if score is not None else 0
         print(f"{cat.name:<12} {score if score is not None else '-':>5}")
     
     # Show total
-    total = upper_total + bonus + sum(state.score_sheet[cat] or 0 for cat in [
-        YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
-        YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
-        YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
-        YahtzeeCategory.CHANCE
-    ])
+    total = upper_total + bonus + lower_total
     print("─" * 20)
-    print(f"{'TOTAL':<12} {total:>5.0f}")
+    print(f"{'TOTAL':<12} {total:>5}")
     
     # Show current combinations if any dice showing
     if any(dice_values):
@@ -424,10 +343,6 @@ def show_action_values(
             for combo in combinations:
                 print(f"• {combo}")
 
-    # Get state encoding and valid actions
-    state_vec = encoder.encode(state)
-    valid_actions = env.get_valid_actions()
-
     # Get Q-values and mask invalid actions
     q_values = agent.get_q_values(state_vec)
     mask = np.full(agent.action_size, float("-inf"))
@@ -454,10 +369,10 @@ def show_action_values(
             points = env.calc_score(action.data, state.current_dice)
             print(f"{i}. Score {action.data.name} for {points} points (EV: {value:.1f})")
 
-    return state, valid_q[:num_top]
+    return state, valid_q[:num_top], q_values
 
 
-def evaluate_performance(agent: YahtzeeAgent, num_games: int = 100) -> None:
+def evaluate_performance(agent: YahtzeeAgent, num_games: int = 50) -> None:
     """Run multiple games and show detailed performance statistics."""
     print(f"\nEvaluating agent performance over {num_games} games...")
     scores = []
@@ -475,7 +390,7 @@ def evaluate_performance(agent: YahtzeeAgent, num_games: int = 100) -> None:
         done = False
 
         while not done:
-            state_vec = encoder.encode(state)
+            state_vec = encoder.encode(state, opponent_value=0.5)
             valid_actions = env.get_valid_actions()
             if not valid_actions:
                 break
@@ -555,24 +470,36 @@ def main():
     parser.add_argument(
         "--num-games",
         type=int,
-        default=100,
-        help="Number of games to play in performance evaluation mode (default: 100)",
+        default=50,
+        help="Number of games to play in performance evaluation mode (default: 50)",
+    )
+    parser.add_argument(
+        "--objective",
+        type=str,
+        choices=["win", "avg_score"],
+        default="win",
+        help="Evaluation objective (win or avg_score)",
     )
     args = parser.parse_args()
 
     # Load the agent
-    agent = load_agent(args.model)
+    agent = load_agent(args.model, args.objective)
+    current_objective = args.objective
 
     while True:
         print("\n=== Yahtzee RL Challenge ===")
+        print("\nCurrent Settings:")
+        print(f"• Objective: {current_objective.upper()}")
+        print(f"• Games per evaluation: {args.num_games}")
         print("\nSelect a mode:")
         print("• [1] Simulation Mode - Watch agent play a full game")
         print("• [2] Calculation Mode - Analyze expected values for each action")
         print(f"• [3] Performance Stats - View agent's statistics over {args.num_games} games")
         print("• [4] Load Different Model")
-        print("• [5] Exit")
+        print("• [5] Change Objective")
+        print("• [6] Exit")
 
-        choice = input("\nEnter your choice (1-5): ").strip()
+        choice = input("\nEnter choice (1-6): ").strip()
 
         if choice == "1":
             print("\n=== Simulation Mode ===")
@@ -594,7 +521,7 @@ def main():
             current_state = None
 
             while True:
-                current_state, valid_actions = show_action_values(agent, current_state)
+                current_state, valid_actions, q_values = show_action_values(agent, current_state)
 
                 print("\nOptions:")
                 print("• [1] Take an action and continue analysis")
@@ -632,10 +559,31 @@ def main():
 
         elif choice == "4":
             print("\n=== Load New Model ===")
-            agent = load_agent()  # Will prompt for model selection
+            agent = load_agent(objective=current_objective)  # Will prompt for model selection
             print("\nNew model loaded successfully!")
 
         elif choice == "5":
+            print("\n=== Change Objective ===")
+            print("Select evaluation objective:")
+            print("1. Win Mode (considers opponent strength)")
+            print("2. Average Score Mode (pure score maximization)")
+            
+            while True:
+                subchoice = input("\nEnter choice (1-2): ").strip()
+                if subchoice == "1":
+                    current_objective = "win"
+                    break
+                elif subchoice == "2":
+                    current_objective = "avg_score"
+                    break
+                else:
+                    print("Invalid choice! Please try again.")
+            
+            # Reload agent with new objective
+            agent = load_agent(args.model, current_objective)
+            print(f"\nSwitched to {current_objective.upper()} mode")
+
+        elif choice == "6":
             print("\nThank you for using the Yahtzee RL Challenge demo!")
             break
 

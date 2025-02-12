@@ -1,7 +1,8 @@
 import os
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
+import random
 
 import numpy as np
 import torch
@@ -11,16 +12,20 @@ from tqdm import tqdm
 
 from dqn import YahtzeeAgent
 from encoder import StateEncoder
-from env import IDX_TO_ACTION, NUM_ACTIONS, ActionType, GameState, YahtzeeEnv
+from env import IDX_TO_ACTION, NUM_ACTIONS, ActionType, GameState, YahtzeeEnv, YahtzeeCategory
 
 
 def evaluate_agent(
     agent: YahtzeeAgent, num_games: int = 100, objective: str = "win"
 ) -> dict:
-    """Evaluate agent performance across multiple games."""
+    """
+    Evaluate agent performance across multiple games.
+    Returns statistics for both training rewards and actual game scores.
+    """
     env = YahtzeeEnv()
     encoder = StateEncoder(use_opponent_value=(objective == "win"))
-    scores = []
+    actual_scores = []
+    training_rewards = []
 
     # Store original state and set to eval mode
     was_training = agent.training_mode
@@ -44,25 +49,57 @@ def evaluate_agent(
             state, reward, done, _ = env.step(action_idx)
             total_reward += reward
 
-        scores.append(total_reward)
+        # Track training reward
+        training_rewards.append(total_reward)
+
+        # Calculate actual game score
+        upper_total = sum(state.score_sheet[cat] or 0 for cat in [
+            YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
+            YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
+        ])
+        bonus = 35 if upper_total >= 63 else 0
+        lower_total = sum(state.score_sheet[cat] or 0 for cat in [
+            YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
+            YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
+            YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
+            YahtzeeCategory.CHANCE
+        ])
+        actual_score = upper_total + bonus + lower_total
+        actual_scores.append(actual_score)
 
     # Restore original state
     if was_training:
         agent.train()
 
-    # Calculate statistics
-    scores = np.array(scores)
+    # Calculate statistics for both metrics
+    actual_scores = np.array(actual_scores)
+    training_rewards = np.array(training_rewards)
+    
     stats = {
-        "mean": np.mean(scores),
-        "median": np.median(scores),
-        "std": np.std(scores),
-        "max": np.max(scores),
-        "min": np.min(scores),
+        "actual_score": {
+            "mean": np.mean(actual_scores),
+            "median": np.median(actual_scores),
+            "std": np.std(actual_scores),
+            "max": np.max(actual_scores),
+            "min": np.min(actual_scores),
+        },
+        "training_reward": {
+            "mean": np.mean(training_rewards),
+            "median": np.median(training_rewards),
+            "std": np.std(training_rewards),
+            "max": np.max(training_rewards),
+            "min": np.min(training_rewards),
+        }
     }
 
-    print(
-        f"\nEval Mean: {stats['mean']:.1f} ± {stats['std']:.1f}, Max: {stats['max']:.1f}, Min: {stats['min']:.1f}"
-    )
+    print("\nEvaluation Results:")
+    print("Actual Scores:")
+    print(f"Mean: {stats['actual_score']['mean']:.1f} ± {stats['actual_score']['std']:.1f}")
+    print(f"Max: {stats['actual_score']['max']:.1f}, Min: {stats['actual_score']['min']:.1f}")
+    print("\nTraining Rewards:")
+    print(f"Mean: {stats['training_reward']['mean']:.1f} ± {stats['training_reward']['std']:.1f}")
+    print(f"Max: {stats['training_reward']['max']:.1f}, Min: {stats['training_reward']['min']:.1f}")
+    
     return stats
 
 
@@ -143,7 +180,7 @@ def save_checkpoint(
 def train(
     run_id: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
-    num_episodes: int = 100000,  # increased from 50000
+    num_episodes: int = 100000,
     num_envs: int = 32,
     steps_per_update: int = 8,
     checkpoint_freq: int = 100,
@@ -220,6 +257,7 @@ def train(
         for episode in progress:
             episode_rewards = []
             episode_losses = []
+            actual_scores = []  # Track actual scores for each environment
 
             # Reset all environments
             states = [env.reset() for env in envs]
@@ -287,6 +325,23 @@ def train(
                     if loss is not None:
                         episode_losses.append(loss)
 
+            # Calculate actual scores for completed environments
+            for i, (state, done) in enumerate(zip(states, dones)):
+                if done:
+                    upper_total = sum(state.score_sheet[cat] or 0 for cat in [
+                        YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
+                        YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
+                    ])
+                    bonus = 35 if upper_total >= 63 else 0
+                    lower_total = sum(state.score_sheet[cat] or 0 for cat in [
+                        YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
+                        YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
+                        YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
+                        YahtzeeCategory.CHANCE
+                    ])
+                    actual_score = upper_total + bonus + lower_total
+                    actual_scores.append(actual_score)
+
             episode_rewards.extend(total_rewards)
             metrics["episode_rewards"].extend(episode_rewards)
             if episode_losses:
@@ -294,11 +349,13 @@ def train(
 
             mean_reward = np.mean(episode_rewards)
             mean_loss = np.mean(episode_losses) if episode_losses else None
+            mean_actual_score = np.mean(actual_scores) if actual_scores else None
 
             wandb.log(
                 {
                     "episode": episode,
                     "reward": mean_reward,
+                    "actual_score": mean_actual_score,
                     "epsilon": agent.epsilon,
                     "loss": mean_loss,
                     "learning_rate": agent.optimizer.param_groups[0]["lr"],
@@ -320,14 +377,17 @@ def train(
             # Evaluate agent
             if (episode + 1) % eval_freq == 0:
                 eval_stats = evaluate_agent(agent, num_eval_episodes, objective)
-                mean_eval_score = eval_stats["mean"]
+                mean_eval_score = eval_stats["actual_score"]["mean"]
+                mean_eval_reward = eval_stats["training_reward"]["mean"]
                 metrics["eval_scores"].append(mean_eval_score)
                 metrics["eval_score"] = mean_eval_score
 
                 wandb.log(
                     {
                         "eval_score": mean_eval_score,
-                        "eval_score_std": eval_stats["std"],
+                        "eval_score_std": eval_stats["actual_score"]["std"],
+                        "eval_reward": mean_eval_reward,
+                        "eval_reward_std": eval_stats["training_reward"]["std"],
                     },
                     step=episode,
                 )
@@ -336,12 +396,11 @@ def train(
                     metrics["best_eval_score"] = mean_eval_score
                     filename = save_checkpoint(agent, episode, run_id, metrics, True)
                     wandb.save(filename)
-                    print(f"\nNew best eval score: {mean_eval_score:.1f}")
+                    print(f"\nNew best eval score: {mean_eval_score:.1f} (reward: {mean_eval_reward:.1f})")
 
             current_time = time.time()
             if current_time - last_save_time >= 1800:
                 filename = save_checkpoint(agent, episode + 1, run_id, metrics)
-                wandb.save(filename)
                 last_save_time = current_time
 
     except KeyboardInterrupt:
@@ -357,7 +416,6 @@ def train(
                 "final_mean_reward": np.mean(metrics["episode_rewards"][-100:]),
             }
             filename = save_checkpoint(agent, episode + 1, run_id, final_metrics)
-            wandb.save(filename)
             print(f"Final model saved to: {filename}")
         except Exception as e:
             print(f"Error saving final model: {str(e)}")
@@ -397,7 +455,6 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
     env = YahtzeeEnv()
     encoder = StateEncoder()
     state = env.reset()
-    total_reward = 0
     done = False
     turn = 1
 
@@ -406,8 +463,22 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
 
     while not done:
         if render:
+            # Calculate actual game score for display
+            upper_total = sum(state.score_sheet[cat] or 0 for cat in [
+                YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
+                YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
+            ])
+            bonus = 35 if upper_total >= 63 else 0
+            lower_total = sum(state.score_sheet[cat] or 0 for cat in [
+                YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
+                YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
+                YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
+                YahtzeeCategory.CHANCE
+            ])
+            actual_score = upper_total + bonus + lower_total
+            
             clear_output(wait=True)
-            print(f"\n=== Turn {turn} ===")
+            print(f"\n=== Turn {turn} | Score: {actual_score} ===")
             print(env.render())
 
         state_vec = encoder.encode(state)
@@ -426,25 +497,43 @@ def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
                 held = [i + 1 for i, hold in enumerate(action.data) if hold]
                 print(f"Action: Hold dice at positions {held}")
             else:
-                print(f"Action: Score {action.data.name}")
+                points = env.calc_score(action.data, state.current_dice)
+                print(f"Action: Score {action.data.name} for {points} points")
 
         state, reward, done, _ = env.step(action_idx)
-        total_reward += reward
 
         if render:
             if action.kind == ActionType.SCORE:
-                print(f"Scored {reward:.1f} points")
+                points = env.calc_score(action.data, state.current_dice)
+                print(f"Scored {points} points")
                 turn += 1
             time.sleep(1)
+
+    # Calculate final actual score
+    upper_total = sum(state.score_sheet[cat] or 0 for cat in [
+        YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
+        YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
+    ])
+    bonus = 35 if upper_total >= 63 else 0
+    lower_total = sum(state.score_sheet[cat] or 0 for cat in [
+        YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
+        YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
+        YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
+        YahtzeeCategory.CHANCE
+    ])
+    actual_score = upper_total + bonus + lower_total
 
     if render:
         clear_output(wait=True)
         print("\n=== Game Over ===")
         print(env.render())
-        print(f"\nFinal Score: {total_reward:.1f}")
+        print(f"\nFinal Score: {actual_score}")
+        print(f"• Upper Section: {upper_total}")
+        print(f"• Upper Bonus: {bonus}")
+        print(f"• Lower Section: {lower_total}")
 
     agent.epsilon = old_eps
-    return total_reward
+    return actual_score, reward
 
 
 def show_action_values(

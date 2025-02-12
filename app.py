@@ -9,14 +9,16 @@ import glob
 import time
 
 from play import load_agent, simulate_game, show_action_values, evaluate_performance
-from env import YahtzeeEnv, YahtzeeCategory, GameState, IDX_TO_ACTION, ActionType
+from env import YahtzeeEnv, YahtzeeCategory, GameState, IDX_TO_ACTION, ActionType, NUM_ACTIONS
 from encoder import StateEncoder
+from dqn import YahtzeeAgent
 
 # Global variables to maintain state
 agent = None
 current_state: Optional[GameState] = None
 env = YahtzeeEnv()
 encoder = StateEncoder(use_opponent_value=True)
+current_objective = "win"  # Add global objective state
 
 def get_available_models() -> List[str]:
     """Get list of available model files in models directory."""
@@ -56,13 +58,14 @@ def format_score_sheet(state: GameState) -> str:
     lines = ["Score Board:", "─" * 20, f"{'Category':<12} Score", "─" * 20]
     
     # Upper section
+    upper_total = 0
     for cat in [YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
                YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES]:
         score = state.score_sheet[cat]
+        upper_total += score if score is not None else 0
         lines.append(f"{cat.name:<12} {score if score is not None else '-':>5}")
     
-    # Calculate upper section total and bonus
-    upper_total = sum(state.score_sheet[cat] or 0 for cat in list(state.score_sheet.keys())[:6])
+    # Calculate upper section bonus
     bonus = 35 if upper_total >= 63 else 0
     lines.extend([
         "─" * 20,
@@ -72,23 +75,20 @@ def format_score_sheet(state: GameState) -> str:
     ])
     
     # Lower section
+    lower_total = 0
     for cat in [YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
                YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
                YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
                YahtzeeCategory.CHANCE]:
         score = state.score_sheet[cat]
+        lower_total += score if score is not None else 0
         lines.append(f"{cat.name:<12} {score if score is not None else '-':>5}")
     
     # Total
-    total = upper_total + bonus + sum(state.score_sheet[cat] or 0 for cat in [
-        YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
-        YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
-        YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
-        YahtzeeCategory.CHANCE
-    ])
+    total = upper_total + bonus + lower_total
     lines.extend([
         "─" * 20,
-        f"{'TOTAL':<12} {total:>5.0f}"
+        f"{'TOTAL':<12} {total:>5}"
     ])
     
     return "\n".join(lines)
@@ -131,23 +131,50 @@ def format_combinations(dice_values: np.ndarray) -> str:
         return "\nPossible Combinations:\n" + "\n".join(f"• {combo}" for combo in combinations)
     return ""
 
-def load_model(model_choice: str) -> str:
-    """Load a model and return status message."""
-    global agent
+def load_model(model_path: str) -> Tuple[str, None]:
+    """Load a model from the specified path."""
+    global agent, current_objective
+    
     try:
-        agent = load_agent(model_choice)
-        return f"Successfully loaded model: {os.path.basename(model_choice)}"
+        # Create encoder instance to get state size
+        encoder = StateEncoder(use_opponent_value=(current_objective == "win"))
+        
+        # Initialize agent with correct parameters
+        agent = YahtzeeAgent(
+            state_size=encoder.state_size,
+            action_size=NUM_ACTIONS,
+            batch_size=512,
+            gamma=0.997,
+            learning_rate=5e-5,
+            target_update=50,
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        
+        # Use load method instead of load_state_dict
+        agent.load(model_path)
+        agent.eval()
+        
+        return f"Successfully loaded model from {model_path}", None
     except Exception as e:
-        return f"Error loading model: {str(e)}"
+        return f"Error loading model: {str(e)}", None
+
+def set_objective(obj: str) -> Tuple[str, None]:
+    """Set the current evaluation objective."""
+    global current_objective
+    current_objective = obj
+    return f"Evaluation objective set to: {obj}", None
 
 def run_simulation() -> Tuple[str, str]:
     """Run a full game simulation and return the game log."""
+    global current_objective
+    
     if agent is None:
         return "Please load a model first.", ""
     
     env = YahtzeeEnv()
+    encoder = StateEncoder(use_opponent_value=(current_objective == "win"))
     state = env.reset()
-    total_reward = 0
+    total_reward = 0  # For training rewards
     done = False
     turn = 1
     game_log = []
@@ -158,21 +185,37 @@ def run_simulation() -> Tuple[str, str]:
     
     try:
         while not done:
+            # Calculate actual game score
+            upper_total = sum(state.score_sheet[cat] or 0 for cat in [
+                YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
+                YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
+            ])
+            bonus = 35 if upper_total >= 63 else 0
+            lower_total = sum(state.score_sheet[cat] or 0 for cat in [
+                YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
+                YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
+                YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
+                YahtzeeCategory.CHANCE
+            ])
+            actual_score = upper_total + bonus + lower_total
+            
             # Format current state
-            game_log.append(f"\n=== Turn {turn} | Score: {total_reward:.0f} ===")
+            game_log.append(f"\n=== Turn {turn} | Score: {actual_score} ===")
             game_log.append(format_dice_state(state.current_dice, state.rolls_left))
             game_log.append(format_score_sheet(state))
             game_log.append(format_combinations(state.current_dice))
             
             # Get agent's action
-            state_vec = encoder.encode(state)
+            state_vec = encoder.encode(
+                state, 
+                opponent_value=0.5 if current_objective == "win" else 0.0
+            )
             valid_actions = env.get_valid_actions()
             if not valid_actions:
                 break
                 
             # Get Q-values and select best action
             q_values = agent.get_q_values(state_vec)
-            q_values = q_values - total_reward  # Make values relative to current score
             
             # Apply action masking
             mask = np.full(agent.action_size, float("-inf"))
@@ -213,35 +256,42 @@ def run_simulation() -> Tuple[str, str]:
         game_log.append(format_score_sheet(state))
         
         # Calculate final scores
-        upper_scores = [state.score_sheet[cat] or 0 for cat in [
+        upper_total = sum(state.score_sheet[cat] or 0 for cat in [
             YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
             YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
-        ]]
-        upper_total = sum(upper_scores)
+        ])
         bonus = 35 if upper_total >= 63 else 0
-        lower_score = total_reward - upper_total - bonus
+        lower_total = sum(state.score_sheet[cat] or 0 for cat in [
+            YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
+            YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
+            YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
+            YahtzeeCategory.CHANCE
+        ])
+        actual_score = upper_total + bonus + lower_total
         
-        game_log.append(f"\nFinal Score: {total_reward:.0f}")
+        game_log.append(f"\nFinal Score: {actual_score}")
         game_log.append(f"• Upper Section: {upper_total}")
         game_log.append(f"• Upper Bonus: {bonus}")
-        game_log.append(f"• Lower Section: {lower_score:.0f}")
+        game_log.append(f"• Lower Section: {lower_total}")
         
         agent.epsilon = old_eps
-        return "\n".join(game_log), f"Final Score: {total_reward:.0f}"
+        return "\n".join(game_log), f"Final Score: {actual_score}"
         
     except Exception as e:
         return f"Error during simulation: {str(e)}", ""
 
 def analyze_state(state_input: Optional[str] = None) -> Tuple[str, str]:
     """Analyze current state or create new state."""
-    global current_state
+    global current_state, env
     
     if agent is None:
         return "Please load a model first.", ""
         
     if state_input == "new":
+        env = YahtzeeEnv()  # Reset environment
         current_state = env.reset()
     elif current_state is None:
+        env = YahtzeeEnv()  # Reset environment
         current_state = env.reset()
     
     # Format current state
@@ -298,7 +348,7 @@ def take_action(action_num: int) -> Tuple[str, str]:
     valid_actions = env.get_valid_actions()
     
     if not valid_actions:
-        return "No valid actions available.", ""
+        return "No valid actions available.", format_score_sheet(current_state)
         
     q_values = agent.get_q_values(state_vec)
     mask = np.full(agent.action_size, float("-inf"))
@@ -309,34 +359,87 @@ def take_action(action_num: int) -> Tuple[str, str]:
     valid_q.sort(key=lambda x: x[1], reverse=True)
     
     if not 1 <= action_num <= len(valid_q):
-        return f"Invalid action number. Please choose between 1 and {len(valid_q)}.", ""
+        return f"Invalid action number. Please choose between 1 and {len(valid_q)}.", format_dice_state(current_state.current_dice, current_state.rolls_left) + "\n" + format_score_sheet(current_state)
         
     # Take the action
     action_idx = valid_q[action_num - 1][0]
+    action = IDX_TO_ACTION[action_idx]
+    old_state = current_state
     current_state, reward, done, _ = env.step(action_idx)
     
+    # Format action result message
+    if action.kind == ActionType.ROLL:
+        action_msg = "Rolling all dice"
+    elif action.kind == ActionType.HOLD:
+        held = [i + 1 for i, hold in enumerate(action.data) if hold]
+        if held:
+            held_values = [old_state.current_dice[i-1] for i in held]
+            action_msg = f"Holding positions {', '.join(f'{pos}({val})' for pos, val in zip(held, held_values))}"
+        else:
+            action_msg = "Rolling all dice"
+    else:
+        points = env.calc_score(action.data, old_state.current_dice)
+        action_msg = f"Scoring {action.data.name} for {points} points"
+    
+    result = [
+        f"Action taken: {action_msg}",
+        f"Reward: {reward:.1f}",
+        ""
+    ]
+    
     if done:
-        result = "Game Over!"
+        result.append("Game Over!")
         current_state = None
     else:
-        result = f"Action taken, received reward: {reward:.1f}"
+        # Get updated state analysis
+        state_vec = encoder.encode(current_state)
+        valid_actions = env.get_valid_actions()
+        q_values = agent.get_q_values(state_vec)
+        mask = np.full(agent.action_size, float("-inf"))
+        mask[valid_actions] = 0
+        q_values = q_values + mask
         
-    # Get updated state analysis
-    action_analysis, state_display = analyze_state()
-    return f"{result}\n\n{action_analysis}", state_display
+        valid_q = [(i, q_values[i]) for i in valid_actions]
+        valid_q.sort(key=lambda x: x[1], reverse=True)
+        
+        result.append("Top Actions and Their Expected Values:")
+        for i, (action_idx, value) in enumerate(valid_q[:5], 1):
+            action = IDX_TO_ACTION[action_idx]
+            if action.kind == ActionType.ROLL:
+                result.append(f"{i}. Roll all dice (EV: {value:.1f})")
+            elif action.kind == ActionType.HOLD:
+                held = [i + 1 for i, hold in enumerate(action.data) if hold]
+                if held:
+                    held_values = [current_state.current_dice[i-1] for i in held]
+                    result.append(f"{i}. Hold {', '.join(f'{pos}({val})' for pos, val in zip(held, held_values))} (EV: {value:.1f})")
+                else:
+                    result.append(f"{i}. Roll all dice (EV: {value:.1f})")
+            else:
+                points = env.calc_score(action.data, current_state.current_dice)
+                result.append(f"{i}. Score {action.data.name} for {points} points (EV: {value:.1f})")
+    
+    # Format current state
+    state_display = []
+    if current_state is not None:
+        state_display.append(format_dice_state(current_state.current_dice, current_state.rolls_left))
+        state_display.append(format_score_sheet(current_state))
+        state_display.append(format_combinations(current_state.current_dice))
+    
+    return "\n".join(result), "\n".join(state_display)
 
-def run_performance_analysis() -> Tuple[str, None]:
+def run_performance_analysis(num_games: int = 100) -> Tuple[str, None]:
     """Run performance analysis and return statistics."""
     if agent is None:
         return "Please load a model first.", None
         
     try:
         # Run evaluation
-        scores = []
+        actual_scores = []
+        training_rewards = []
         old_eps = agent.epsilon
         agent.epsilon = 0.02
         
-        for _ in range(100):
+        for _ in range(num_games):
             state = env.reset()
             total_reward = 0
             done = False
@@ -345,141 +448,190 @@ def run_performance_analysis() -> Tuple[str, None]:
                 state_vec = encoder.encode(state)
                 valid_actions = env.get_valid_actions()
                 
-                # Skip if no valid actions
                 if not valid_actions:
                     break
                     
-                # Get Q-values and select best action
                 q_values = agent.get_q_values(state_vec)
-                
-                # Apply action masking
                 mask = np.full(agent.action_size, float("-inf"))
                 mask[valid_actions] = 0
                 q_values = q_values + mask
                 
-                # Get top action
                 valid_q = [(i, q_values[i]) for i in valid_actions]
                 valid_q.sort(key=lambda x: x[1], reverse=True)
                 action_idx = valid_q[0][0]
                 
-                # Take action
                 state, reward, done, _ = env.step(action_idx)
                 total_reward += reward
                 
-            scores.append(total_reward)
+            training_rewards.append(total_reward)
+            
+            # Calculate actual game score
+            upper_total = sum(state.score_sheet[cat] or 0 for cat in [
+                YahtzeeCategory.ONES, YahtzeeCategory.TWOS, YahtzeeCategory.THREES,
+                YahtzeeCategory.FOURS, YahtzeeCategory.FIVES, YahtzeeCategory.SIXES
+            ])
+            bonus = 35 if upper_total >= 63 else 0
+            lower_total = sum(state.score_sheet[cat] or 0 for cat in [
+                YahtzeeCategory.THREE_OF_A_KIND, YahtzeeCategory.FOUR_OF_A_KIND,
+                YahtzeeCategory.FULL_HOUSE, YahtzeeCategory.SMALL_STRAIGHT,
+                YahtzeeCategory.LARGE_STRAIGHT, YahtzeeCategory.YAHTZEE,
+                YahtzeeCategory.CHANCE
+            ])
+            actual_score = upper_total + bonus + lower_total
+            actual_scores.append(actual_score)
             
         agent.epsilon = old_eps
         
         # Calculate statistics
-        scores = np.array(scores)
-        mean_score = np.mean(scores)
-        median_score = np.median(scores)
-        std_score = np.std(scores)
-        min_score = np.min(scores)
-        max_score = np.max(scores)
-        percentile_25 = np.percentile(scores, 25)
-        percentile_75 = np.percentile(scores, 75)
+        actual_scores = np.array(actual_scores)
+        training_rewards = np.array(training_rewards)
         
-        # Format statistics with ASCII visualization
-        stats = f"""Performance Statistics (100 games)
+        # Format statistics with simplified visualization
+        header = f"Performance Analysis ({num_games} games)\n"
 
-Key Metrics:
-• Mean Score:   {mean_score:.1f} ± {std_score:.1f}
-• Median Score: {median_score:.1f}
-• Min Score:    {min_score:.1f}
-• Max Score:    {max_score:.1f}
+        scores_section = f"""
+Game Scores
+Mean:   {np.mean(actual_scores):>6.1f} ± {np.std(actual_scores):.1f}
+Median: {np.median(actual_scores):>6.1f}
+Range:  {np.min(actual_scores):>6.1f} - {np.max(actual_scores):.1f}
+"""
 
-Score Distribution:
-• 25th percentile: {percentile_25:.1f}
-• 75th percentile: {percentile_75:.1f}
-• IQR:            {(percentile_75 - percentile_25):.1f}
-
-Score Brackets:"""
-        
-        # Add score distribution in brackets
+        # Add score distribution with simplified visualization
         brackets = [(0, 100), (100, 150), (150, 200), (200, 250), (250, 300), (300, float('inf'))]
+        max_count = max(np.sum((actual_scores >= low) & (actual_scores < high)) for low, high in brackets)
+        bar_scale = 30.0 / max_count  # Scale to max width of 30 characters
+        
+        distribution_rows = []
+        distribution_rows.append("\nScore Distribution")
+        distribution_rows.append("Range    Count   %     Distribution")
+        
         for low, high in brackets:
-            count = np.sum((scores >= low) & (scores < high))
-            percentage = (count / len(scores)) * 100
+            count = np.sum((actual_scores >= low) & (actual_scores < high))
+            percentage = (count / num_games) * 100
             high_str = f"{high:.0f}" if high != float('inf') else "inf"
-            bar = "█" * int(percentage / 2)  # Each █ represents 2%
-            stats += f"\n• {low:3.0f}-{high_str:>3}: {bar} {count:3.0f} games ({percentage:4.1f}%)"
+            bar = "█" * int(count * bar_scale)
+            distribution_rows.append(
+                f"{low:>3d}-{high_str:<4s} {count:>3d}  {percentage:>5.1f}%  {bar}"
+            )
+        
+        distribution_section = "\n".join(distribution_rows)
+        
+        # Combine all sections
+        full_report = f"{header}{scores_section}{distribution_section}"
             
-        return stats, None
+        return full_report, None
         
     except Exception as e:
         return f"Error during performance analysis: {str(e)}", None
 
 def create_interface() -> gr.Blocks:
     """Create the Gradio interface."""
-    with gr.Blocks(title="Yahtzee RL Challenge") as interface:
-        gr.Markdown("""# Yahtzee RL Challenge
-        
-This interface demonstrates a Deep Q-Learning agent trained to play Yahtzee. The agent makes decisions by evaluating the expected value of each possible action, considering both immediate rewards and potential future gains.
-
-Start by selecting a trained model, then explore the different modes:
-1. **Simulation Mode**: Watch the agent play a complete game
-2. **Calculation Mode**: Analyze expected values for each possible action
-3. **Performance Stats**: View the agent's statistics over 100 games
+    with gr.Blocks(title="Yahtzee RL") as interface:
+        gr.Markdown("""# Yahtzee RL
+        Select a model and objective (win/avg_score), then load it to begin. Use the tabs below to:
+        - Simulation: Watch a full game
+        - Calculation: Analyze moves step by step
+        - Analysis: Get performance statistics
         """)
         
-        # Model loading section
+        # Model and objective selection
         with gr.Row():
             model_choices = get_available_models()
             model_dropdown = gr.Dropdown(
                 choices=[format_model_name(m) for m in model_choices],
                 value=format_model_name(model_choices[0]) if model_choices else None,
                 label="Select Model",
-                info="Models are sorted by newest first"
+                info="Choose a trained model to use"
             )
-            load_button = gr.Button("Load Selected Model")
+            objective_radio = gr.Radio(
+                choices=["win", "avg_score"],
+                value="win",
+                label="Objective",
+                info="win: vs opponent, avg_score: maximize points"
+            )
+            load_button = gr.Button("Load Model")
             model_status = gr.Textbox(label="Status", interactive=False)
             
-        # Connect the dropdown value to the actual model path
-        def on_load_model(choice: str) -> str:
+        # Create tabs for different modes
+        with gr.Tabs() as tabs:
+            # Simulation Mode
+            with gr.Tab("Simulation"):
+                gr.Markdown("Click 'Start New Game' to watch the AI play a complete game.")
+                sim_button = gr.Button("Start New Game")
+                sim_output = gr.Textbox(
+                    label="Game Log",
+                    interactive=False,
+                    lines=25
+                )
+                sim_score = gr.Textbox(
+                    label="Final Result",
+                    interactive=False
+                )
+            
+            # Calculation Mode
+            with gr.Tab("Calculation"):
+                gr.Markdown("1. Click 'New Game State' 2. Choose action number (1-5) 3. Click 'Take Action'")
+                with gr.Row():
+                    new_state_button = gr.Button("New Game State")
+                    action_input = gr.Number(
+                        label="Action Number",
+                        value=1,
+                        minimum=1,
+                        maximum=5,
+                        step=1
+                    )
+                    take_action_button = gr.Button("Take Action")
+                with gr.Row():
+                    action_output = gr.Textbox(
+                        label="Action Analysis",
+                        interactive=False,
+                        lines=10
+                    )
+                    state_output = gr.Textbox(
+                        label="Current State",
+                        interactive=False,
+                        lines=10
+                    )
+            
+            # Performance Stats
+            with gr.Tab("Analysis"):
+                gr.Markdown("Adjust number of games and click 'Run Analysis' to see performance statistics.")
+                num_games_input = gr.Slider(
+                    minimum=10,
+                    maximum=1000,
+                    value=100,
+                    step=10,
+                    label="Number of Games"
+                )
+                stats_button = gr.Button("Run Analysis")
+                stats_output = gr.Textbox(
+                    label="Results",
+                    interactive=False,
+                    lines=20
+                )
+        
+        # Connect components
+        def on_load_model(choice: str, objective: str) -> str:
             if not choice:
                 return "Please select a model"
-            # Find the corresponding model path
             idx = [format_model_name(m) for m in model_choices].index(choice)
             return load_model(model_choices[idx])
         
-        # Create tabs for different modes
-        with gr.Tabs():
-            # Simulation Mode
-            with gr.Tab("Simulation Mode"):
-                gr.Markdown("""Watch the agent play a complete game of Yahtzee. The agent will show its decision-making process for each move.""")
-                sim_button = gr.Button("Start New Game")
-                with gr.Row():
-                    sim_output = gr.Textbox(label="Game Log", interactive=False)
-                    sim_score = gr.Textbox(label="Result", interactive=False)
-            
-            # Calculation Mode
-            with gr.Tab("Calculation Mode"):
-                gr.Markdown("""Analyze the expected value of each possible action in any game state.""")
-                with gr.Row():
-                    new_state_button = gr.Button("New Game State")
-                    action_input = gr.Number(label="Action Number", value=1, minimum=1, maximum=5, step=1)
-                    take_action_button = gr.Button("Take Action")
-                with gr.Row():
-                    action_output = gr.Textbox(label="Action Analysis", interactive=False)
-                    state_output = gr.Textbox(label="Current State", interactive=False)
-            
-            # Performance Stats
-            with gr.Tab("Performance Stats"):
-                gr.Markdown("""View detailed statistics of the agent's performance over 100 games.""")
-                stats_button = gr.Button("Run Performance Analysis")
-                with gr.Row():
-                    stats_output = gr.Textbox(label="Statistics", interactive=False)
-        
-        # Connect components
-        load_button.click(on_load_model, inputs=[model_dropdown], outputs=[model_status])
+        load_button.click(on_load_model, inputs=[model_dropdown, objective_radio], outputs=[model_status])
         sim_button.click(run_simulation, outputs=[sim_output, sim_score])
         new_state_button.click(analyze_state, inputs=[gr.Textbox(value="new", visible=False)], outputs=[action_output, state_output])
         take_action_button.click(take_action, inputs=[action_input], outputs=[action_output, state_output])
-        stats_button.click(run_performance_analysis, outputs=[stats_output])
+        stats_button.click(run_performance_analysis, inputs=[num_games_input], outputs=[stats_output])
         
     return interface
 
+# Create the demo interface
+demo = create_interface()
+
 if __name__ == "__main__":
-    interface = create_interface()
-    interface.launch(share=True) 
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=True,
+        show_error=True
+    ) 
