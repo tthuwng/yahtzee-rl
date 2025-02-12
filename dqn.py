@@ -1,20 +1,26 @@
 import random
 from collections import deque, namedtuple
-from typing import List, Tuple
+from typing import List
+
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-Transition = namedtuple("Transition", ["state", "action", "reward", "next_state", "done"])
+Transition = namedtuple(
+    "Transition", ["state", "action", "reward", "next_state", "done"]
+)
+
 
 class NstepReplayBuffer:
     """
     Simple N-step replay buffer (no priority for simplicity).
     Just store n-step transitions and pop them.
     """
-    def __init__(self, capacity: int = 100000, n_step: int = 3, gamma: float = 0.99):
+
+    def __init__(self, capacity: int = 300000, n_step: int = 5, gamma: float = 0.99):
         self.capacity = capacity
         self.n_step = n_step
         self.gamma = gamma
@@ -31,7 +37,7 @@ class NstepReplayBuffer:
         done_final = False
         s0, a0 = transitions[0].state, transitions[0].action
         next_s_final = transitions[-1].next_state
-        for i, tr in enumerate(transitions):
+        for tr in transitions:
             R += discount * tr.reward
             discount *= self.gamma
             if tr.done:
@@ -44,9 +50,9 @@ class NstepReplayBuffer:
         self.nstep_queue.append(Transition(state, action, reward, next_state, done))
         # if we have n-step transitions, save them
         if len(self.nstep_queue) == self.n_step or done:
-            # compute n-step return
-            n_s, n_a, n_r, n_next, n_done = self._calc_nstep_return(list(self.nstep_queue))
-            # store
+            n_s, n_a, n_r, n_next, n_done = self._calc_nstep_return(
+                list(self.nstep_queue)
+            )
             if len(self.buffer) < self.capacity:
                 self.buffer.append(Transition(n_s, n_a, n_r, n_next, n_done))
             else:
@@ -73,43 +79,29 @@ class NstepReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+
 class DQN(nn.Module):
-    """ Wider net, no dropout, residual blocks. """
+    """Simpler DQN with two linear layers + dueling heads."""
+
     def __init__(self, state_size: int, action_size: int):
         super().__init__()
         self.state_size = state_size
         self.action_size = action_size
 
-        # Input
-        self.input_layer = nn.Sequential(
-            nn.Linear(state_size, 512),
-            nn.ReLU(),
-            nn.LayerNorm(512)
-        )
-
-        # 2 Residual blocks
-        self.res_blocks = nn.ModuleList()
-        for _ in range(2):
-            block = nn.Sequential(
-                nn.Linear(512, 512),
-                nn.ReLU(),
-                nn.LayerNorm(512),
-                nn.Linear(512, 512),
-                nn.ReLU(),
-                nn.LayerNorm(512)
-            )
-            self.res_blocks.append(block)
+        # Feature layers
+        self.fc1 = nn.Linear(state_size, 256)
+        self.fc2 = nn.Linear(256, 256)
 
         # Dueling streams
         self.value_stream = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(256, 1),
+            nn.Linear(128, 1),
         )
         self.adv_stream = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(256, action_size),
+            nn.Linear(128, action_size),
         )
 
         self.apply(self._init_weights)
@@ -121,33 +113,35 @@ class DQN(nn.Module):
 
     def forward(self, x: torch.Tensor):
         if x.shape[-1] != self.state_size:
-            raise ValueError(f"Wrong input size, expected {self.state_size} got {x.shape[-1]}")
+            raise ValueError(
+                f"Wrong input size, expected {self.state_size} got {x.shape[-1]}"
+            )
 
-        x = self.input_layer(x)
-        for block in self.res_blocks:
-            residual = x
-            x = block(x) + residual
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
 
-        val = self.value_stream(x)           # [B, 1]
-        adv = self.adv_stream(x)             # [B, action_size]
+        val = self.value_stream(x)  # [B, 1]
+        adv = self.adv_stream(x)  # [B, action_size]
         q = val + adv - adv.mean(dim=1, keepdim=True)
         return q
 
+
 class YahtzeeAgent:
-    """N-step DQN agent with bigger net, ignoring mismatch keys on load."""
+    """N-step DQN agent with simpler net architecture."""
+
     def __init__(
         self,
         state_size: int,
         action_size: int,
-        batch_size: int = 512,
+        batch_size: int = 1024,
         gamma: float = 0.99,
-        lr: float = 1e-4,
+        lr: float = 3e-4,
         device: str = "cuda",
-        n_step: int = 3,
-        target_update: int = 100,
-        min_epsilon: float = 0.01,
-        epsilon_decay: float = 0.9995,
-        num_envs: int = 32
+        n_step: int = 5,
+        target_update: int = 500,
+        min_epsilon: float = 0.005,
+        epsilon_decay: float = 0.9997,
+        num_envs: int = 32,
     ):
         self.state_size = state_size
         self.action_size = action_size
@@ -161,11 +155,10 @@ class YahtzeeAgent:
         self.batch_size = batch_size
         self.lr = lr
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=200000, eta_min=1e-5)
-        
+
         self.n_step = n_step
-        self.buffer = NstepReplayBuffer(capacity=200000, n_step=n_step, gamma=gamma)
-        
+        self.buffer = NstepReplayBuffer(capacity=300000, n_step=n_step, gamma=gamma)
+
         # Initialize n-step buffers for each environment
         self.num_envs = num_envs
         self.nstep_buffers = [deque(maxlen=n_step) for _ in range(num_envs)]
@@ -234,14 +227,19 @@ class YahtzeeAgent:
         next_states_t = torch.from_numpy(next_states_np).float().to(self.device)
         dones_t = torch.from_numpy(dones_np).float().to(self.device)
 
-        # Compute Q values
+        # Current Q
         current_q = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1))
+
+        # Next Q (Double DQN)
         with torch.no_grad():
             next_actions = self.policy_net(next_states_t).argmax(dim=1, keepdim=True)
             next_q = self.target_net(next_states_t).gather(1, next_actions)
-            target_q = rewards_t.unsqueeze(1) + (1 - dones_t.unsqueeze(1)) * (self.gamma ** self.n_step) * next_q
+            target_q = (
+                rewards_t.unsqueeze(1)
+                + (1 - dones_t.unsqueeze(1)) * ((self.gamma) ** self.n_step) * next_q
+            )
 
-        # Compute loss and update
+        # Compute loss
         loss = F.smooth_l1_loss(current_q, target_q)
         self.optimizer.zero_grad()
         loss.backward()
@@ -253,8 +251,7 @@ class YahtzeeAgent:
         if self.learn_steps % self.target_update == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
-        # Update learning rate and epsilon
-        self.scheduler.step()
+        # Decay epsilon
         self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
         return loss.item()
@@ -266,15 +263,20 @@ class YahtzeeAgent:
         return q
 
     def train_step(self, state, action, reward, next_state, done) -> float:
-        return self.train_step_batch([state],[action],[reward],[next_state],[done])
+        return self.train_step_batch(
+            [state], [action], [reward], [next_state], [done], [0]
+        )
 
     def save(self, path: str):
-        torch.save({
-            "policy_net": self.policy_net.state_dict(),
-            "target_net": self.target_net.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "epsilon": self.epsilon
-        }, path)
+        torch.save(
+            {
+                "policy_net": self.policy_net.state_dict(),
+                "target_net": self.target_net.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "epsilon": self.epsilon,
+            },
+            path,
+        )
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device)

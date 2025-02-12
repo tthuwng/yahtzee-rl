@@ -9,7 +9,7 @@ import wandb
 from IPython.display import clear_output
 from tqdm import tqdm
 
-from dqn import YahtzeeAgent  # We now have an agent with bigger net and N-step
+from dqn import YahtzeeAgent
 from encoder import StateEncoder
 from env import IDX_TO_ACTION, NUM_ACTIONS, YahtzeeEnv
 
@@ -43,22 +43,25 @@ def evaluate_agent(agent: YahtzeeAgent, num_games: int = 100) -> dict:
     print(f"Eval -> Mean: {mean_score:.1f}, Median: {median_score:.1f}, Max: {mx:.1f}, Min: {mn:.1f}")
     agent.train()
     return {
-        "mean": mean_score,
-        "median": median_score,
-        "std": std_score,
-        "max": mx,
-        "min": mn
+        'mean': mean_score,
+        'median': median_score,
+        'std': std_score,
+        'max': mx,
+        'min': mn
     }
 
 def train(
     run_id: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
-    num_episodes: int = 150000,
-    num_envs: int = 32,
+    num_episodes: int = 50000,
+    num_envs: int = 16,
     steps_per_update: int = 8,
-    eval_freq: int = 200,
+    eval_freq: int = 1000,
     num_eval_episodes: int = 50
 ):
+    """
+    Simplified training loop with fewer episodes and smaller parallel env count to speed up.
+    """
     if run_id is None:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     wandb.init(project="yahtzee-rl", name=f"yahtzee_run_{run_id}")
@@ -67,7 +70,7 @@ def train(
     envs = [YahtzeeEnv() for _ in range(num_envs)]
     encoders = [StateEncoder(use_opponent_value=False) for _ in range(num_envs)]
 
-    # get state size
+    # Get state size
     dummy_s = envs[0].reset()
     dummy_vec = encoders[0].encode(dummy_s)
     state_size = len(dummy_vec)
@@ -75,14 +78,14 @@ def train(
     agent = YahtzeeAgent(
         state_size=state_size,
         action_size=NUM_ACTIONS,
-        batch_size=512,
+        batch_size=1024,
         gamma=0.99,
-        lr=1e-4,
+        lr=3e-4,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        n_step=3,
-        target_update=100,
-        min_epsilon=0.01,
-        epsilon_decay=0.9995,
+        n_step=5,
+        target_update=500,
+        min_epsilon=0.005,
+        epsilon_decay=0.9997,
         num_envs=num_envs
     )
 
@@ -175,8 +178,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_id", type=str, default=None)
-    parser.add_argument("--episodes", type=int, default=150000)
-    parser.add_argument("--num_envs", type=int, default=32)
+    parser.add_argument("--episodes", type=int, default=50000)
+    parser.add_argument("--num_envs", type=int, default=16)
     parser.add_argument("--checkpoint", type=str, default=None)
     args = parser.parse_args()
 
