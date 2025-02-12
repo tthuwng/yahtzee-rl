@@ -139,6 +139,9 @@ def load_model(model_path: str) -> Tuple[str, None]:
         # Create encoder instance to get state size
         encoder = StateEncoder(use_opponent_value=(current_objective == "win"))
         
+        # Determine device - use CPU if CUDA not available
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         # Initialize agent with correct parameters
         agent = YahtzeeAgent(
             state_size=encoder.state_size,
@@ -147,14 +150,14 @@ def load_model(model_path: str) -> Tuple[str, None]:
             gamma=0.997,
             learning_rate=5e-5,
             target_update=50,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device=device  # Pass device explicitly
         )
         
-        # Use load method instead of load_state_dict
+        # Load model with proper device mapping
         agent.load(model_path)
         agent.eval()
         
-        return f"Successfully loaded model from {model_path}", None
+        return f"Successfully loaded model from {model_path} (using {device})", None
     except Exception as e:
         return f"Error loading model: {str(e)}", None
 
@@ -486,40 +489,42 @@ def run_performance_analysis(num_games: int = 100) -> Tuple[str, None]:
         actual_scores = np.array(actual_scores)
         training_rewards = np.array(training_rewards)
         
-        # Format statistics with simplified visualization
-        header = f"Performance Analysis ({num_games} games)\n"
-
-        scores_section = f"""
-Game Scores
-Mean:   {np.mean(actual_scores):>6.1f} ± {np.std(actual_scores):.1f}
-Median: {np.median(actual_scores):>6.1f}
-Range:  {np.min(actual_scores):>6.1f} - {np.max(actual_scores):.1f}
-"""
-
-        # Add score distribution with simplified visualization
+        # Format statistics with clear sections
+        output = []
+        
+        # Header
+        output.append(f"Performance Analysis ({num_games} games)")
+        output.append("=" * 40)
+        output.append("")
+        
+        # Game Score Statistics
+        output.append("Game Score Statistics")
+        output.append("-" * 20)
+        output.append(f"Mean:    {np.mean(actual_scores):>6.1f} ± {np.std(actual_scores):.1f}")
+        output.append(f"Median:  {np.median(actual_scores):>6.1f}")
+        output.append(f"Range:   {np.min(actual_scores):>6.1f} - {np.max(actual_scores):.1f}")
+        output.append("")
+        
+        # Score Distribution
+        output.append("Score Distribution")
+        output.append("-" * 20)
+        output.append(f"{'Range':<10} {'Count':>6} {'%':>6}  {'Distribution':<30}")
+        output.append("-" * 60)
+        
+        # Calculate distribution with visual bars
         brackets = [(0, 100), (100, 150), (150, 200), (200, 250), (250, 300), (300, float('inf'))]
         max_count = max(np.sum((actual_scores >= low) & (actual_scores < high)) for low, high in brackets)
-        bar_scale = 30.0 / max_count  # Scale to max width of 30 characters
-        
-        distribution_rows = []
-        distribution_rows.append("\nScore Distribution")
-        distribution_rows.append("Range    Count   %     Distribution")
+        bar_scale = 30.0 / max_count if max_count > 0 else 0
         
         for low, high in brackets:
             count = np.sum((actual_scores >= low) & (actual_scores < high))
             percentage = (count / num_games) * 100
-            high_str = f"{high:.0f}" if high != float('inf') else "inf"
             bar = "█" * int(count * bar_scale)
-            distribution_rows.append(
-                f"{low:>3d}-{high_str:<4s} {count:>3d}  {percentage:>5.1f}%  {bar}"
-            )
+            high_str = str(high) if high != float('inf') else "inf"
+            output.append(f"{low:>3}-{high_str:<6} {count:>6} {percentage:>5.1f}%  {bar}")
         
-        distribution_section = "\n".join(distribution_rows)
-        
-        # Combine all sections
-        full_report = f"{header}{scores_section}{distribution_section}"
-            
-        return full_report, None
+        # Join with proper newlines for Gradio display
+        return "\n".join(output).replace("\n", "<br>"), None
         
     except Exception as e:
         return f"Error during performance analysis: {str(e)}", None
@@ -604,10 +609,9 @@ def create_interface() -> gr.Blocks:
                     label="Number of Games"
                 )
                 stats_button = gr.Button("Run Analysis")
-                stats_output = gr.Textbox(
+                stats_output = gr.HTML(
                     label="Results",
-                    interactive=False,
-                    lines=20
+                    value=""
                 )
         
         # Connect components
