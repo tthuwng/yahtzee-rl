@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Add these at the top of the file, after imports
 __all__ = [
     "YahtzeeCategory",
     "ActionType",
@@ -249,14 +248,14 @@ class YahtzeeEnv:
         # Slight baseline for any valid scoring move
         bonus_reward += 2.0
 
-        # Encourage big combos
-        if max_count >= 5:
-            # Yahtzee potential
-            bonus_reward += 12.0
-        elif max_count == 4:
-            bonus_reward += 6.0
-        elif max_count == 3:
-            bonus_reward += 3.0
+        # encourage big combos (increased from previous values)
+        if (
+            max_count >= 4
+            and self.state.score_sheet.get(YahtzeeCategory.YAHTZEE) is None
+        ):
+            bonus_reward += 10.0  # was 8
+        elif max_count >= 3:
+            bonus_reward += 4.0  # was 3
 
         # More emphasis on upper section progression
         if category in upper_cats:
@@ -277,32 +276,21 @@ class YahtzeeEnv:
 
         # Reward special combos
         if category == YahtzeeCategory.FULL_HOUSE and base_score == 25:
-            bonus_reward += 6.0
+            bonus_reward += 5.0  # was 4
         elif category == YahtzeeCategory.SMALL_STRAIGHT and base_score == 30:
-            bonus_reward += 7.0
+            bonus_reward += 6.0  # was 5
         elif category == YahtzeeCategory.LARGE_STRAIGHT and base_score == 40:
-            bonus_reward += 9.0
+            bonus_reward += 8.0  # was 6
         elif category == YahtzeeCategory.YAHTZEE and base_score == 50:
-            bonus_reward += 15.0
+            bonus_reward += 15.0  # was 10
 
         # Stronger penalties for zeroing out high-potential categories
         if base_score == 0:
             # If it's CHANCE and we got 0, likely we had no dice, punish heavily
             if category == YahtzeeCategory.CHANCE:
-                bonus_reward -= 12.0
+                bonus_reward -= 12.0  # was 10
             else:
-                # More severe penalty for categories that can yield large points
-                if category in [
-                    YahtzeeCategory.THREE_OF_A_KIND,
-                    YahtzeeCategory.FOUR_OF_A_KIND,
-                    YahtzeeCategory.FULL_HOUSE,
-                    YahtzeeCategory.SMALL_STRAIGHT,
-                    YahtzeeCategory.LARGE_STRAIGHT,
-                    YahtzeeCategory.YAHTZEE,
-                ]:
-                    bonus_reward -= 8.0
-                else:
-                    bonus_reward -= 5.0
+                bonus_reward -= 6.0   # was 4
 
         return base_score + bonus_reward
 
