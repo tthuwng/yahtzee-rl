@@ -82,7 +82,8 @@ def train(
         n_step=3,
         target_update=100,
         min_epsilon=0.01,
-        epsilon_decay=0.9995
+        epsilon_decay=0.9995,
+        num_envs=num_envs
     )
 
     if checkpoint_path:
@@ -142,11 +143,12 @@ def train(
 
             # train
             agent.train_step_batch(
-                [states[i] for i in active_idxs],
+                [encoders[i].encode(states[i]) for i in active_idxs],
                 [a if a is not None else 0 for a in actions],
                 rewards,
-                [ns for ns in next_states],
-                new_dones
+                [encoders[i].encode(ns) for i, ns in enumerate(next_states)],
+                new_dones,
+                active_idxs
             )
 
             for i, s_new, d_new in zip(active_idxs, next_states, new_dones):

@@ -146,7 +146,8 @@ class YahtzeeAgent:
         n_step: int = 3,
         target_update: int = 100,
         min_epsilon: float = 0.01,
-        epsilon_decay: float = 0.9995
+        epsilon_decay: float = 0.9995,
+        num_envs: int = 32
     ):
         self.state_size = state_size
         self.action_size = action_size
@@ -160,8 +161,14 @@ class YahtzeeAgent:
         self.batch_size = batch_size
         self.lr = lr
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=200000, eta_min=1e-5)
+        
         self.n_step = n_step
         self.buffer = NstepReplayBuffer(capacity=200000, n_step=n_step, gamma=gamma)
+        
+        # Initialize n-step buffers for each environment
+        self.num_envs = num_envs
+        self.nstep_buffers = [deque(maxlen=n_step) for _ in range(num_envs)]
 
         self.epsilon = 1.0
         self.min_epsilon = min_epsilon
@@ -203,45 +210,51 @@ class YahtzeeAgent:
         rewards: List[float],
         next_states: List[np.ndarray],
         dones: List[bool],
+        env_indices: List[int],
     ) -> float:
-        # store transitions
+        """Train on a batch of transitions."""
+        # Store transitions in buffer
         for s, a, r, ns, d in zip(states, actions, rewards, next_states, dones):
-            self.store_transition(s, a, r, ns, d)
+            self.buffer.push(s, a, r, ns, d)
 
         if len(self.buffer) < self.batch_size:
             return 0.0
 
-        sample = self.buffer.sample(self.batch_size)
-        if sample is None:
+        # Sample and train
+        batch = self.buffer.sample(self.batch_size)
+        if batch is None:
             return 0.0
 
-        states_np, actions_np, rewards_np, next_states_np, dones_np = sample
+        states_np, actions_np, rewards_np, next_states_np, dones_np = batch
 
-        # convert to Tensors
-        st = torch.from_numpy(states_np).float().to(self.device)
-        ac = torch.from_numpy(actions_np).long().to(self.device)
-        rw = torch.from_numpy(rewards_np).float().to(self.device)
-        ns = torch.from_numpy(next_states_np).float().to(self.device)
-        dn = torch.from_numpy(dones_np).float().to(self.device)
+        # Convert to tensors
+        states_t = torch.from_numpy(states_np).float().to(self.device)
+        actions_t = torch.from_numpy(actions_np).long().to(self.device)
+        rewards_t = torch.from_numpy(rewards_np).float().to(self.device)
+        next_states_t = torch.from_numpy(next_states_np).float().to(self.device)
+        dones_t = torch.from_numpy(dones_np).float().to(self.device)
 
-        # Q-learning with Double DQN
-        q_values = self.policy_net(st).gather(1, ac.unsqueeze(1))  # shape [B,1]
+        # Compute Q values
+        current_q = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1))
         with torch.no_grad():
-            next_actions = self.policy_net(ns).argmax(dim=1, keepdim=True)
-            next_q = self.target_net(ns).gather(1, next_actions)
-            target = rw.unsqueeze(1) + (1 - dn.unsqueeze(1)) * self.gamma * next_q
+            next_actions = self.policy_net(next_states_t).argmax(dim=1, keepdim=True)
+            next_q = self.target_net(next_states_t).gather(1, next_actions)
+            target_q = rewards_t.unsqueeze(1) + (1 - dones_t.unsqueeze(1)) * (self.gamma ** self.n_step) * next_q
 
-        loss = F.smooth_l1_loss(q_values, target)
+        # Compute loss and update
+        loss = F.smooth_l1_loss(current_q, target_q)
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
         self.optimizer.step()
 
+        # Update target network
         self.learn_steps += 1
         if self.learn_steps % self.target_update == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
-        # Epsilon decay
+        # Update learning rate and epsilon
+        self.scheduler.step()
         self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
         return loss.item()
@@ -274,4 +287,5 @@ class YahtzeeAgent:
                 self.optimizer.load_state_dict(ckpt["optimizer"])
             except:
                 pass
+        self.epsilon = ckpt.get("epsilon", 1.0)
         self.epsilon = ckpt.get("epsilon", 1.0)
