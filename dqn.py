@@ -202,12 +202,17 @@ class YahtzeeAgent:
         actions: List[int],
         rewards: List[float],
         next_states: List[np.ndarray],
-        dones: List[bool],
-        env_indices: List[int],
+        dones: List[bool]
     ) -> float:
-        """Train on a batch of transitions."""
-        # Store transitions in buffer
+        """Train on a batch of transitions with encoded states."""
+        # Store transitions in buffer (ensure states are float32 numpy arrays)
         for s, a, r, ns, d in zip(states, actions, rewards, next_states, dones):
+            s = np.asarray(s, dtype=np.float32)
+            ns = np.asarray(ns, dtype=np.float32)
+            if s.shape != (self.state_size,):
+                raise ValueError(f"State shape mismatch. Expected ({self.state_size},), got {s.shape}")
+            if ns.shape != (self.state_size,):
+                raise ValueError(f"Next state shape mismatch. Expected ({self.state_size},), got {ns.shape}")
             self.buffer.push(s, a, r, ns, d)
 
         if len(self.buffer) < self.batch_size:
@@ -264,7 +269,7 @@ class YahtzeeAgent:
 
     def train_step(self, state, action, reward, next_state, done) -> float:
         return self.train_step_batch(
-            [state], [action], [reward], [next_state], [done], [0]
+            [state], [action], [reward], [next_state], [done]
         )
 
     def save(self, path: str):

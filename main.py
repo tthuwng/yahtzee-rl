@@ -63,17 +63,25 @@ def populate_replay_with_baseline(agent: YahtzeeAgent, num_games: int = 50):
     This 'pretraining' can help the agent see some decent transitions.
     """
     env = YahtzeeEnv()
-    enc = StateEncoder()
+    encoder = StateEncoder(use_opponent_value=False)  # Match training encoder settings
     agent.eval()  # no epsilon exploration
+    
     for _ in range(num_games):
-        s = env.reset()
+        state = env.reset()
         done = False
         while not done:
-            state_vec = enc.encode(s)
-            a = simple_baseline_policy(s, env)
-            next_s, r, done, _info = env.step(a)
-            agent.store_transition(state_vec, a, r, enc.encode(next_s), done)
-            s = next_s
+            state_vec = encoder.encode(state)
+            action = simple_baseline_policy(state, env)
+            next_state, reward, done, _info = env.step(action)
+            next_state_vec = encoder.encode(next_state)
+            
+            # Ensure states are float32 numpy arrays
+            state_vec = np.asarray(state_vec, dtype=np.float32)
+            next_state_vec = np.asarray(next_state_vec, dtype=np.float32)
+            
+            agent.store_transition(state_vec, action, reward, next_state_vec, done)
+            state = next_state
+    
     # Return to training mode
     agent.train()
 
@@ -230,8 +238,8 @@ def train(
                 [encoders[i].encode(states[i]) for i in active_idxs],
                 [a if a is not None else 0 for a in actions],
                 rewards,
-                [ns for ns in next_states],
-                new_dones,
+                [encoders[i].encode(next_states[i]) for i in active_idxs],
+                new_dones
             )
 
             for i, s_new, d_new in zip(active_idxs, next_states, new_dones):
