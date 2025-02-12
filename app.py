@@ -139,6 +139,9 @@ def load_model(model_path: str) -> Tuple[str, None]:
         # Create encoder instance to get state size
         encoder = StateEncoder(use_opponent_value=(current_objective == "win"))
         
+        # Determine device - use CPU if CUDA not available
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         # Initialize agent with correct parameters
         agent = YahtzeeAgent(
             state_size=encoder.state_size,
@@ -147,14 +150,14 @@ def load_model(model_path: str) -> Tuple[str, None]:
             gamma=0.997,
             learning_rate=5e-5,
             target_update=50,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device=device  # Pass device explicitly
         )
         
-        # Use load method instead of load_state_dict
+        # Load model with proper device mapping
         agent.load(model_path)
         agent.eval()
         
-        return f"Successfully loaded model from {model_path}", None
+        return f"Successfully loaded model from {model_path} (using {device})", None
     except Exception as e:
         return f"Error loading model: {str(e)}", None
 
