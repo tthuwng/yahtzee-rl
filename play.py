@@ -7,11 +7,11 @@ import numpy as np
 import torch
 from IPython.display import clear_output
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 from dqn import YahtzeeAgent
 from encoder import StateEncoder
 from env import IDX_TO_ACTION, NUM_ACTIONS, ActionType, GameState, YahtzeeEnv, YahtzeeCategory
-from utils import visualize_game_state
 
 
 def list_available_models(models_dir: str = "models") -> List[str]:
@@ -132,7 +132,8 @@ def load_agent(model_path: Optional[str] = None) -> YahtzeeAgent:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    encoder = StateEncoder()
+    # Initialize encoder with use_opponent_value=True to match saved model
+    encoder = StateEncoder(use_opponent_value=True)
     agent = YahtzeeAgent(
         state_size=encoder.state_size,
         action_size=NUM_ACTIONS,
@@ -154,7 +155,7 @@ def load_agent(model_path: Optional[str] = None) -> YahtzeeAgent:
 def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> float:
     """Run a full game simulation with visualization."""
     env = YahtzeeEnv()
-    encoder = StateEncoder()
+    encoder = StateEncoder(use_opponent_value=True)
     state = env.reset()
     total_reward = 0
     done = False
@@ -337,7 +338,7 @@ def show_action_values(
 ) -> Tuple[GameState, list]:
     """Show expected values for all valid actions in current state."""
     env = YahtzeeEnv()
-    encoder = StateEncoder()
+    encoder = StateEncoder(use_opponent_value=True)
 
     if state is None:
         state = env.reset()
@@ -457,17 +458,18 @@ def show_action_values(
 
 
 def evaluate_performance(agent: YahtzeeAgent, num_games: int = 100) -> None:
-    """Run multiple games and show performance statistics."""
+    """Run multiple games and show detailed performance statistics."""
     print(f"\nEvaluating agent performance over {num_games} games...")
     scores = []
     env = YahtzeeEnv()
-    encoder = StateEncoder()
+    encoder = StateEncoder(use_opponent_value=True)
 
     # Store original epsilon and set to minimum for deterministic evaluation
     old_eps = agent.epsilon
     agent.epsilon = 0.02
 
-    for i in range(num_games):
+    # Run games with progress bar
+    for i in tqdm(range(num_games), desc="Playing games"):
         state = env.reset()
         total_reward = 0
         done = False
@@ -483,36 +485,78 @@ def evaluate_performance(agent: YahtzeeAgent, num_games: int = 100) -> None:
             total_reward += reward
 
         scores.append(total_reward)
-        if (i + 1) % 10 == 0:
-            print(f"Completed {i + 1} games...")
 
     # Restore original epsilon
     agent.epsilon = old_eps
 
-    # Calculate statistics
+    # Calculate detailed statistics
     scores = np.array(scores)
-    print("\nPerformance Statistics:")
-    print(f"Mean Score: {np.mean(scores):.1f} ± {np.std(scores):.1f}")
-    print(f"Median Score: {np.median(scores):.1f}")
-    print(f"Min Score: {np.min(scores):.1f}")
-    print(f"Max Score: {np.max(scores):.1f}")
+    mean_score = np.mean(scores)
+    median_score = np.median(scores)
+    std_score = np.std(scores)
+    min_score = np.min(scores)
+    max_score = np.max(scores)
+    percentile_25 = np.percentile(scores, 25)
+    percentile_75 = np.percentile(scores, 75)
+
+    print("\n=== Performance Statistics ===")
+    print(f"Number of games: {num_games}")
+    print("\nKey Metrics:")
+    print(f"• Mean Score:   {mean_score:.1f} ± {std_score:.1f}")
+    print(f"• Median Score: {median_score:.1f}")
+    print(f"• Min Score:    {min_score:.1f}")
+    print(f"• Max Score:    {max_score:.1f}")
+    print("\nScore Distribution:")
+    print(f"• 25th percentile: {percentile_25:.1f}")
+    print(f"• 75th percentile: {percentile_75:.1f}")
+    print(f"• IQR:            {(percentile_75 - percentile_25):.1f}")
+    
+    # Calculate score brackets
+    brackets = [(0, 100), (100, 150), (150, 200), (200, 250), (250, 300), (300, float('inf'))]
+    print("\nScore Distribution:")
+    for low, high in brackets:
+        count = np.sum((scores >= low) & (scores < high))
+        percentage = (count / num_games) * 100
+        high_str = f"{high:.0f}" if high != float('inf') else "inf"
+        print(f"• {low:3.0f}-{high_str:>3}: {count:3.0f} games ({percentage:4.1f}%)")
     
     # Plot score distribution
-    plt.figure(figsize=(10, 5))
-    plt.hist(scores, bins=20, color='blue', alpha=0.7)
+    plt.figure(figsize=(12, 6))
+    
+    # Histogram
+    plt.subplot(1, 2, 1)
+    plt.hist(scores, bins=20, color='blue', alpha=0.7, edgecolor='black')
+    plt.axvline(mean_score, color='red', linestyle='dashed', linewidth=2, label=f'Mean: {mean_score:.1f}')
+    plt.axvline(median_score, color='green', linestyle='dashed', linewidth=2, label=f'Median: {median_score:.1f}')
     plt.xlabel('Score')
-    plt.ylabel('Count')
+    plt.ylabel('Number of Games')
     plt.title('Score Distribution')
+    plt.legend()
     plt.grid(True, alpha=0.3)
+    
+    # Box plot
+    plt.subplot(1, 2, 2)
+    plt.boxplot(scores, vert=False)
+    plt.xlabel('Score')
+    plt.title('Score Box Plot')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
     plt.show()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Play Yahtzee with a trained agent")
+    parser = argparse.ArgumentParser(description="Yahtzee RL Challenge - Deep Q-Learning Agent")
     parser.add_argument(
         "--model",
         type=str,
         help="Path to the trained model file (optional, will prompt for selection if not provided)",
+    )
+    parser.add_argument(
+        "--num-games",
+        type=int,
+        default=100,
+        help="Number of games to play in performance evaluation mode (default: 100)",
     )
     args = parser.parse_args()
 
@@ -520,38 +564,48 @@ def main():
     agent = load_agent(args.model)
 
     while True:
-        print("\n=== Yahtzee AI Interface ===")
-        print("\nSelect an option:")
-        print("• [1] Watch Agent Play")
-        print("• [2] Analyze Moves")
-        print("• [3] Evaluate Performance")
+        print("\n=== Yahtzee RL Challenge ===")
+        print("\nSelect a mode:")
+        print("• [1] Simulation Mode - Watch agent play a full game")
+        print("• [2] Calculation Mode - Analyze expected values for each action")
+        print(f"• [3] Performance Stats - View agent's statistics over {args.num_games} games")
         print("• [4] Load Different Model")
         print("• [5] Exit")
 
         choice = input("\nEnter your choice (1-5): ").strip()
 
         if choice == "1":
-            print("\nStarting game simulation...")
+            print("\n=== Simulation Mode ===")
+            print("Watch the agent play a full game of Yahtzee.")
+            print("The agent will show its decision-making process for each move.")
+            input("Press Enter to start the game...")
             simulate_game(agent)
-            input("\nPress Enter to return to menu...")
+            
+            print("\nWould you like to:")
+            print("1. Play another game")
+            print("2. Return to main menu")
+            subchoice = input("\nEnter choice (1-2): ").strip()
+            if subchoice != "1":
+                continue
 
         elif choice == "2":
-            print("\nStarting move analysis...")
+            print("\n=== Calculation Mode ===")
+            print("Analyze the expected value of each possible action in any game state.")
             current_state = None
 
             while True:
                 current_state, valid_actions = show_action_values(agent, current_state)
 
-                print("\nSelect an option:")
-                print("• [1] Take an action and continue")
-                print("• [2] Start new game")
+                print("\nOptions:")
+                print("• [1] Take an action and continue analysis")
+                print("• [2] Start new game state")
                 print("• [3] Return to main menu")
 
                 subchoice = input("\nEnter choice (1-3): ").strip()
 
                 if subchoice == "1":
                     try:
-                        action_num = int(input("\nEnter action number: ").strip())
+                        action_num = int(input("\nEnter action number to simulate: ").strip())
                         if 1 <= action_num <= len(valid_actions):
                             action_idx = valid_actions[action_num - 1][0]
                             env = YahtzeeEnv()
@@ -571,22 +625,18 @@ def main():
                     break
 
         elif choice == "3":
-            try:
-                num_games = int(input("\nEnter number of games to evaluate (default 100): ") or "100")
-                print(f"\nEvaluating agent performance over {num_games} games...")
-                evaluate_performance(agent, num_games)
-                input("\nPress Enter to return to menu...")
-            except ValueError:
-                print("\nInvalid input! Using default of 100 games.")
-                evaluate_performance(agent, 100)
-                input("\nPress Enter to return to menu...")
+            print("\n=== Performance Statistics ===")
+            print(f"Running {args.num_games} full games to evaluate agent performance...")
+            evaluate_performance(agent, args.num_games)
+            input("\nPress Enter to return to menu...")
 
         elif choice == "4":
+            print("\n=== Load New Model ===")
             agent = load_agent()  # Will prompt for model selection
             print("\nNew model loaded successfully!")
 
         elif choice == "5":
-            print("\nThanks for playing! Goodbye.")
+            print("\nThank you for using the Yahtzee RL Challenge demo!")
             break
 
         else:
