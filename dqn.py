@@ -2,7 +2,6 @@ import random
 from collections import deque, namedtuple
 from typing import List
 
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,22 +12,31 @@ Transition = namedtuple(
     "Transition", ["state", "action", "reward", "next_state", "done"]
 )
 
-
-class NstepReplayBuffer:
+class PrioritizedNstepReplayBuffer:
     """
-    Simple N-step replay buffer (no priority for simplicity).
-    Just store n-step transitions and pop them.
+    A prioritized N-step replay buffer storing transitions with priority
+    for improved sampling of rare or high-error experiences.
     """
 
-    def __init__(self, capacity: int = 300000, n_step: int = 5, gamma: float = 0.99):
+    def __init__(self, capacity=300000, n_step=5, gamma=0.99, alpha=0.6, beta=0.4):
+        """
+        :param capacity: Max number of transitions to store
+        :param n_step: Number of steps for multi-step returns
+        :param gamma: Discount factor
+        :param alpha: Priority exponent
+        :param beta: Importance sampling exponent
+        """
         self.capacity = capacity
         self.n_step = n_step
         self.gamma = gamma
+        self.alpha = alpha
+        self.beta = beta
 
         self.buffer = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
         self.pos = 0
-
         self.nstep_queue = deque(maxlen=n_step)
+        self.max_priority = 1.0
 
     def _calc_nstep_return(self, transitions: List[Transition]):
         """Compute discounted n-step return."""
@@ -48,15 +56,17 @@ class NstepReplayBuffer:
 
     def push(self, state, action, reward, next_state, done):
         self.nstep_queue.append(Transition(state, action, reward, next_state, done))
-        # if we have n-step transitions, save them
+        # If we have n-step transitions, save them
         if len(self.nstep_queue) == self.n_step or done:
             n_s, n_a, n_r, n_next, n_done = self._calc_nstep_return(
                 list(self.nstep_queue)
             )
             if len(self.buffer) < self.capacity:
                 self.buffer.append(Transition(n_s, n_a, n_r, n_next, n_done))
+                self.priorities[len(self.buffer) - 1] = self.max_priority
             else:
                 self.buffer[self.pos] = Transition(n_s, n_a, n_r, n_next, n_done)
+                self.priorities[self.pos] = self.max_priority
                 self.pos = (self.pos + 1) % self.capacity
 
             if done:
@@ -65,23 +75,44 @@ class NstepReplayBuffer:
     def sample(self, batch_size: int):
         if len(self.buffer) == 0:
             return None
-        indices = np.random.randint(0, len(self.buffer), size=batch_size)
-        batch = [self.buffer[idx] for idx in indices]
 
-        states = np.stack([b.state for b in batch])
-        actions = np.array([b.action for b in batch])
-        rewards = np.array([b.reward for b in batch], dtype=np.float32)
-        next_states = np.stack([b.next_state for b in batch])
-        dones = np.array([b.done for b in batch], dtype=np.float32)
+        # Compute probabilities from priorities
+        priorities = self.priorities[: len(self.buffer)]
+        probs = priorities ** self.alpha
+        probs /= probs.sum()
 
-        return states, actions, rewards, next_states, dones
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        transitions = [self.buffer[idx] for idx in indices]
+        total = len(self.buffer)
+
+        # Compute importance sampling weights
+        weights = (total * probs[indices]) ** (-self.beta)
+        weights /= weights.max()
+
+        states = np.stack([tr.state for tr in transitions])
+        actions = np.array([tr.action for tr in transitions])
+        rewards = np.array([tr.reward for tr in transitions], dtype=np.float32)
+        next_states = np.stack([tr.next_state for tr in transitions])
+        dones = np.array([tr.done for tr in transitions], dtype=np.float32)
+
+        return states, actions, rewards, next_states, dones, indices, weights
+
+    def update_priorities(self, indices, priorities):
+        """
+        Update the priorities of sampled transitions based on new TD errors.
+        """
+        for idx, prio in zip(indices, priorities):
+            self.priorities[idx] = max(prio, 1e-6)
+            self.max_priority = max(self.max_priority, prio)
 
     def __len__(self):
         return len(self.buffer)
 
 
 class DQN(nn.Module):
-    """Simpler DQN with two linear layers + dueling heads."""
+    """
+    Dueling DQN with three linear layers + dueling heads for value & advantage.
+    """
 
     def __init__(self, state_size: int, action_size: int):
         super().__init__()
@@ -89,8 +120,9 @@ class DQN(nn.Module):
         self.action_size = action_size
 
         # Feature layers
-        self.fc1 = nn.Linear(state_size, 256)
-        self.fc2 = nn.Linear(256, 256)
+        self.fc1 = nn.Linear(state_size, 512)
+        self.fc2 = nn.Linear(512, 512)
+        self.fc3 = nn.Linear(512, 256)
 
         # Dueling streams
         self.value_stream = nn.Sequential(
@@ -119,15 +151,16 @@ class DQN(nn.Module):
 
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
 
         val = self.value_stream(x)  # [B, 1]
-        adv = self.adv_stream(x)  # [B, action_size]
+        adv = self.adv_stream(x)    # [B, action_size]
         q = val + adv - adv.mean(dim=1, keepdim=True)
         return q
 
 
 class YahtzeeAgent:
-    """N-step DQN agent with simpler net architecture."""
+    """N-step DQN agent with simpler net architecture + Prioritized Replay."""
 
     def __init__(
         self,
@@ -142,6 +175,8 @@ class YahtzeeAgent:
         min_epsilon: float = 0.005,
         epsilon_decay: float = 0.9997,
         num_envs: int = 32,
+        alpha: float = 0.6,   # PER alpha
+        beta: float = 0.4,    # PER beta
     ):
         self.state_size = state_size
         self.action_size = action_size
@@ -157,11 +192,14 @@ class YahtzeeAgent:
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
 
         self.n_step = n_step
-        self.buffer = NstepReplayBuffer(capacity=300000, n_step=n_step, gamma=gamma)
+        # Use prioritized replay
+        self.buffer = PrioritizedNstepReplayBuffer(
+            capacity=300000, n_step=n_step, gamma=gamma,
+            alpha=alpha, beta=beta
+        )
 
-        # Initialize n-step buffers for each environment
+        # For multi-environment training if needed
         self.num_envs = num_envs
-        self.nstep_buffers = [deque(maxlen=n_step) for _ in range(num_envs)]
 
         self.epsilon = 1.0
         self.min_epsilon = min_epsilon
@@ -169,6 +207,8 @@ class YahtzeeAgent:
         self.learn_steps = 0
         self.target_update = target_update
         self.training_mode = True
+        self.alpha = alpha
+        self.beta = beta
 
     def train(self):
         self.training_mode = True
@@ -204,26 +244,22 @@ class YahtzeeAgent:
         next_states: List[np.ndarray],
         dones: List[bool]
     ) -> float:
-        """Train on a batch of transitions with encoded states."""
-        # Store transitions in buffer (ensure states are float32 numpy arrays)
+        """
+        Train on a batch of transitions with encoded states + PER updates.
+        """
         for s, a, r, ns, d in zip(states, actions, rewards, next_states, dones):
             s = np.asarray(s, dtype=np.float32)
             ns = np.asarray(ns, dtype=np.float32)
-            if s.shape != (self.state_size,):
-                raise ValueError(f"State shape mismatch. Expected ({self.state_size},), got {s.shape}")
-            if ns.shape != (self.state_size,):
-                raise ValueError(f"Next state shape mismatch. Expected ({self.state_size},), got {ns.shape}")
             self.buffer.push(s, a, r, ns, d)
 
         if len(self.buffer) < self.batch_size:
             return 0.0
 
-        # Sample and train
-        batch = self.buffer.sample(self.batch_size)
-        if batch is None:
+        sample_result = self.buffer.sample(self.batch_size)
+        if sample_result is None:
             return 0.0
 
-        states_np, actions_np, rewards_np, next_states_np, dones_np = batch
+        states_np, actions_np, rewards_np, next_states_np, dones_np, indices, weights = sample_result
 
         # Convert to tensors
         states_t = torch.from_numpy(states_np).float().to(self.device)
@@ -231,25 +267,29 @@ class YahtzeeAgent:
         rewards_t = torch.from_numpy(rewards_np).float().to(self.device)
         next_states_t = torch.from_numpy(next_states_np).float().to(self.device)
         dones_t = torch.from_numpy(dones_np).float().to(self.device)
+        weights_t = torch.from_numpy(weights).float().to(self.device)
 
         # Current Q
-        current_q = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1))
+        current_q = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
 
         # Next Q (Double DQN)
         with torch.no_grad():
-            next_actions = self.policy_net(next_states_t).argmax(dim=1, keepdim=True)
-            next_q = self.target_net(next_states_t).gather(1, next_actions)
-            target_q = (
-                rewards_t.unsqueeze(1)
-                + (1 - dones_t.unsqueeze(1)) * ((self.gamma) ** self.n_step) * next_q
-            )
+            next_actions = self.policy_net(next_states_t).argmax(dim=1)
+            next_q = self.target_net(next_states_t).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            target_q = rewards_t + (1 - dones_t) * (self.gamma ** self.n_step) * next_q
 
-        # Compute loss
-        loss = F.smooth_l1_loss(current_q, target_q)
+        # Compute TD error for PER
+        td_error = target_q - current_q
+        loss = (weights_t * F.smooth_l1_loss(current_q, target_q, reduction='none')).mean()
+
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
         self.optimizer.step()
+
+        # Update priorities
+        new_priorities = td_error.detach().abs().cpu().numpy()
+        self.buffer.update_priorities(indices, new_priorities)
 
         # Update target network
         self.learn_steps += 1
@@ -279,20 +319,21 @@ class YahtzeeAgent:
                 "target_net": self.target_net.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "epsilon": self.epsilon,
+                "alpha": self.alpha,
+                "beta": self.beta,
             },
             path,
         )
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        policy_dict = ckpt["policy_net"]
-        target_dict = ckpt["target_net"]
-        self.policy_net.load_state_dict(policy_dict, strict=False)
-        self.target_net.load_state_dict(target_dict, strict=False)
+        self.policy_net.load_state_dict(ckpt["policy_net"], strict=False)
+        self.target_net.load_state_dict(ckpt["target_net"], strict=False)
         if "optimizer" in ckpt:
             try:
                 self.optimizer.load_state_dict(ckpt["optimizer"])
             except:
                 pass
         self.epsilon = ckpt.get("epsilon", 1.0)
-        self.epsilon = ckpt.get("epsilon", 1.0)
+        self.alpha = ckpt.get("alpha", 0.6)
+        self.beta = ckpt.get("beta", 0.4)

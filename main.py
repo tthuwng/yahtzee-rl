@@ -1,6 +1,5 @@
 from datetime import datetime
 from typing import Optional
-
 import numpy as np
 import torch
 import wandb
@@ -12,27 +11,17 @@ from env import IDX_TO_ACTION, NUM_ACTIONS, YahtzeeEnv
 
 
 def simple_baseline_policy(state, env):
-    """
-    A very naive baseline that picks the category if it yields the highest immediate score,
-    otherwise tries to roll for 'sixes'.
-    Just for demonstration, you can replace with a more elaborate approach.
-    """
     valid_actions = env.get_valid_actions()
     best_action = None
     best_score = -99999
-    # Suppose we find if any SCORING action is valid with immediate high payoff
     for act_idx in valid_actions:
         act = IDX_TO_ACTION[act_idx]
         if act.kind.name == "SCORE":
-            # Evaluate immediate reward for that category
             points = env.calc_score(act.data, env.state.current_dice)
             if points > best_score:
                 best_score = points
                 best_action = act_idx
-
-    # If no better scoring found or we want to keep rolling
-    if best_score < 15:  # small threshold
-        # check if we can ROLL or HOLD
+    if best_score < 15:
         roll_action = None
         hold_actions = []
         for a_idx in valid_actions:
@@ -41,11 +30,9 @@ def simple_baseline_policy(state, env):
                 roll_action = a_idx
             elif act.kind.name == "HOLD":
                 hold_actions.append(a_idx)
-
         if roll_action is not None:
             return roll_action
         if hold_actions:
-            # Just pick the hold that keeps 6's if present
             dice = env.state.current_dice
             mask = np.array([d == 6 for d in dice], dtype=bool)
             for h_idx in hold_actions:
@@ -53,19 +40,13 @@ def simple_baseline_policy(state, env):
                 if np.array_equal(act.data, mask):
                     return h_idx
             return hold_actions[0]
-
     return best_action
 
 
 def populate_replay_with_baseline(agent: YahtzeeAgent, num_games: int = 50):
-    """
-    Runs a simple baseline for N full games, storing transitions in the agent's replay buffer.
-    This 'pretraining' can help the agent see some decent transitions.
-    """
     env = YahtzeeEnv()
-    encoder = StateEncoder(use_opponent_value=False)  # Match training encoder settings
-    agent.eval()  # no epsilon exploration
-    
+    encoder = StateEncoder(use_opponent_value=False)
+    agent.eval()
     for _ in range(num_games):
         state = env.reset()
         done = False
@@ -74,24 +55,15 @@ def populate_replay_with_baseline(agent: YahtzeeAgent, num_games: int = 50):
             action = simple_baseline_policy(state, env)
             next_state, reward, done, _info = env.step(action)
             next_state_vec = encoder.encode(next_state)
-            
-            # Ensure states are float32 numpy arrays
-            state_vec = np.asarray(state_vec, dtype=np.float32)
-            next_state_vec = np.asarray(next_state_vec, dtype=np.float32)
-            
             agent.store_transition(state_vec, action, reward, next_state_vec, done)
             state = next_state
-    
-    # Return to training mode
     agent.train()
 
 
 def evaluate_agent(agent: YahtzeeAgent, num_games: int = 100) -> dict:
-    """Evaluate agent performance across multiple full games."""
     env = YahtzeeEnv()
     encoder = StateEncoder(use_opponent_value=False)
     agent.eval()
-
     scores = []
     for _ in range(num_games):
         state = env.reset()
@@ -107,15 +79,12 @@ def evaluate_agent(agent: YahtzeeAgent, num_games: int = 100) -> dict:
             total_reward += rew
             state = next_s
         scores.append(total_reward)
-
     mean_score = np.mean(scores)
     median_score = np.median(scores)
     std_score = np.std(scores)
     mx = np.max(scores)
     mn = np.min(scores)
-    print(
-        f"Eval -> Mean: {mean_score:.1f}, Median: {median_score:.1f}, Max: {mx:.1f}, Min: {mn:.1f}"
-    )
+    print(f"Eval -> Mean: {mean_score:.1f}, Median: {median_score:.1f}, Max: {mx:.1f}, Min: {mn:.1f}")
     agent.train()
     return {
         "mean": mean_score,
@@ -129,24 +98,18 @@ def evaluate_agent(agent: YahtzeeAgent, num_games: int = 100) -> dict:
 def train(
     run_id: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
-    num_episodes: int = 50000,
+    num_episodes: int = 60000,
     num_envs: int = 16,
     steps_per_update: int = 8,
-    eval_freq: int = 200,
-    num_eval_episodes: int = 50,
+    eval_freq: int = 300,
+    num_eval_episodes: int = 100,
 ):
-    """
-    Simplified training loop with fewer episodes and smaller parallel env count to speed up.
-    """
     if run_id is None:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     wandb.init(project="yahtzee-rl", name=f"yahtzee_run_{run_id}")
 
-    # Create multiple envs
     envs = [YahtzeeEnv() for _ in range(num_envs)]
     encoders = [StateEncoder(use_opponent_value=False) for _ in range(num_envs)]
-
-    # Get state size
     dummy_s = envs[0].reset()
     dummy_vec = encoders[0].encode(dummy_s)
     state_size = len(dummy_vec)
@@ -158,46 +121,52 @@ def train(
         gamma=0.99,
         lr=3e-4,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        n_step=3,
-        target_update=100,
+        n_step=5,
+        target_update=500,
         min_epsilon=0.01,
-        epsilon_decay=0.9995,
+        epsilon_decay=0.9996,
     )
 
-    # Optional: load existing checkpoint
     if checkpoint_path:
         print("Loading checkpoint:", checkpoint_path)
         agent.load(checkpoint_path)
 
-    # (1) Optional pretraining with baseline to populate replay
     print("Populating replay buffer with a simple baseline policy ...")
-    populate_replay_with_baseline(agent, num_games=50)
+    populate_replay_with_baseline(agent, num_games=80)
     print("Baseline transitions added. Replay size:", len(agent.buffer))
 
     progress = tqdm(range(num_episodes), desc="Training")
     last_eval = 0
 
-    # We'll do an epsilon scheduling example
-    initial_epsilon = 1.0
-    final_epsilon = agent.min_epsilon
-    schedule_fraction = 0.5  # halfway
-    for episode in progress:
-        # Example of a custom scheduling approach
-        fraction = min(1.0, episode / (num_episodes * schedule_fraction))
-        agent.epsilon = initial_epsilon + fraction * (final_epsilon - initial_epsilon)
+    # Multi-phase epsilon scheduling
+    # Phase 1: from ep=0 to ep=0.3 * num_episodes => High epsilon -> agent explores
+    # Phase 2: from ep=0.3 to ep=1.0 * num_episodes => agent reduces epsilon
+    max_epsilon = 1.0
+    mid_fraction = 0.3
+    min_epsilon = agent.min_epsilon
 
-        # Reset each env
+    best_mean = -9999
+    best_checkpoint_path = None
+
+    for episode in progress:
+        frac = episode / (num_episodes * mid_fraction)
+        if frac < 1.0:
+            # high exploration
+            agent.epsilon = max_epsilon - frac * (max_epsilon - 0.1)
+        else:
+            # final decay
+            leftover_frac = (episode - (num_episodes * mid_fraction)) / (num_episodes * (1 - mid_fraction))
+            agent.epsilon = 0.1 - leftover_frac * (0.1 - min_epsilon)
+            agent.epsilon = max(min_epsilon, agent.epsilon)
+
         states = [env.reset() for env in envs]
         dones = [False] * num_envs
         total_rewards = [0.0] * num_envs
 
-        # do a short rollout for steps_per_update
         for _ in range(steps_per_update):
             active_idxs = [i for i, d in enumerate(dones) if not d]
             if not active_idxs:
                 break
-
-            # gather states
             state_vecs = []
             valid_actions_list = []
             for i in active_idxs:
@@ -206,7 +175,6 @@ def train(
                 state_vecs.append(st_vec)
                 valid_actions_list.append(va)
 
-            # select actions
             actions = []
             for svec, va in zip(state_vecs, valid_actions_list):
                 if not va:
@@ -215,7 +183,6 @@ def train(
                     a = agent.select_action(svec, va)
                     actions.append(a)
 
-            # step
             next_states = []
             rewards = []
             new_dones = []
@@ -233,12 +200,11 @@ def train(
                     dones[idx] = dn
                     total_rewards[idx] += rew
 
-            # train
             agent.train_step_batch(
                 [encoders[i].encode(states[i]) for i in active_idxs],
                 [a if a is not None else 0 for a in actions],
                 rewards,
-                [encoders[i].encode(next_states[i]) for i in active_idxs],
+                [encoders[i].encode(next_states[j]) for j in range(len(active_idxs))],
                 new_dones
             )
 
@@ -263,21 +229,25 @@ def train(
                 },
                 step=episode,
             )
+            if stats["mean"] > best_mean:
+                best_mean = stats["mean"]
+                best_checkpoint_path = f"models/yahtzee_run_{run_id}_best_eval{int(best_mean)}.pth"
+                agent.save(best_checkpoint_path)
             last_eval = episode
 
-    # final: Save model with .pth extension so play.py and ui.py can pick it up
-    save_path = f"models/yahtzee_run_{run_id}.pth"
+    save_path = f"models/yahtzee_run_{run_id}_final.pth"
     agent.save(save_path)
-    print(f"Training complete. Model saved to {save_path}")
+    print(f"Training complete. Final model saved to {save_path}")
+    if best_checkpoint_path:
+        print(f"Best model was saved to {best_checkpoint_path} with mean {best_mean:.1f}")
     wandb.finish()
 
 
 def main():
     import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_id", type=str, default=None)
-    parser.add_argument("--episodes", type=int, default=50000)
+    parser.add_argument("--episodes", type=int, default=60000)
     parser.add_argument("--num_envs", type=int, default=16)
     parser.add_argument("--checkpoint", type=str, default=None)
     args = parser.parse_args()
