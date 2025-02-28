@@ -1,159 +1,200 @@
+import argparse
 import os
-import time
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import wandb
-from IPython.display import clear_output
 from tqdm import tqdm
 
-from yahtzee_types import ActionType, GameState, YahtzeeCategory
-from encoder import StateEncoder, IDX_TO_ACTION, NUM_ACTIONS
-from env import YahtzeeEnv, RewardStrategy
 from dqn import YahtzeeAgent
+from encoder import StateEncoder
+from env import GameState, RewardStrategy, YahtzeeEnv
+from play import convert_legacy_model
 
 
 def evaluate_agent(
     agent: YahtzeeAgent, num_games: int = 100, objective: str = "win"
 ) -> dict:
+    """
+    Evaluate the agent by playing multiple games and return performance metrics.
+    """
+    scores = []
     env = YahtzeeEnv(
-        reward_strategy=RewardStrategy.POTENTIAL
-        if objective == "win"
-        else RewardStrategy.STANDARD
+        use_opponent_value=(objective == "win"),
+        reward_strategy=RewardStrategy.ENHANCED,
     )
     encoder = StateEncoder(use_opponent_value=(objective == "win"))
-    actual_scores = []
-    training_rewards = []
 
-    was_training = agent.training_mode
-    agent.eval()
+    # Store original epsilon and set to minimum for deterministic evaluation
+    old_eps = agent.epsilon
+    agent.epsilon = 0.02
+    if hasattr(agent.policy_net, "use_noisy") and agent.policy_net.use_noisy:
+        # Sample fresh noise for each evaluation episode
+        agent.policy_net.sample_noise()
 
+    # Run games
     for _ in range(num_games):
         state = env.reset()
-        total_reward = 0
         done = False
+        episode_score = 0
 
         while not done:
             state_vec = encoder.encode(
                 state, opponent_value=0.5 if objective == "win" else 0.0
             )
             valid_actions = env.get_valid_actions()
-            if not valid_actions:
-                break
-
             action_idx = agent.select_action(state_vec, valid_actions)
             state, reward, done, _ = env.step(action_idx)
-            total_reward += reward
+            episode_score += reward
 
-        training_rewards.append(total_reward)
-
-        upper_total = sum(
-            state.score_sheet[cat] or 0
-            for cat in [
-                YahtzeeCategory.ONES,
-                YahtzeeCategory.TWOS,
-                YahtzeeCategory.THREES,
-                YahtzeeCategory.FOURS,
-                YahtzeeCategory.FIVES,
-                YahtzeeCategory.SIXES,
-            ]
+        # Calculate final score the standard way for consistent reporting
+        upper_cats = [
+            cat for i, cat in enumerate(env.state.score_sheet.keys()) if i < 6
+        ]
+        upper_score = sum(env.state.score_sheet[cat] or 0 for cat in upper_cats)
+        upper_bonus = 35 if upper_score >= 63 else 0
+        total_score = (
+            sum(score for score in env.state.score_sheet.values() if score is not None)
+            + upper_bonus
         )
-        bonus = 35 if upper_total >= 63 else 0
-        lower_total = sum(
-            state.score_sheet[cat] or 0
-            for cat in [
-                YahtzeeCategory.THREE_OF_A_KIND,
-                YahtzeeCategory.FOUR_OF_A_KIND,
-                YahtzeeCategory.FULL_HOUSE,
-                YahtzeeCategory.SMALL_STRAIGHT,
-                YahtzeeCategory.LARGE_STRAIGHT,
-                YahtzeeCategory.YAHTZEE,
-                YahtzeeCategory.CHANCE,
-            ]
-        )
-        actual_score = upper_total + bonus + lower_total
-        actual_scores.append(actual_score)
+        scores.append(total_score)
 
-    if was_training:
-        agent.train()
-
-    actual_scores = np.array(actual_scores)
-    training_rewards = np.array(training_rewards)
-
-    stats = {
-        "actual_score": {
-            "mean": np.mean(actual_scores),
-            "median": np.median(actual_scores),
-            "std": np.std(actual_scores),
-            "max": np.max(actual_scores),
-            "min": np.min(actual_scores),
-        },
-        "training_reward": {
-            "mean": np.mean(training_rewards),
-            "median": np.median(training_rewards),
-            "std": np.std(training_rewards),
-            "max": np.max(training_rewards),
-            "min": np.min(training_rewards),
-        },
+    # Calculate metrics
+    scores = np.array(scores)
+    metrics = {
+        "mean_score": float(np.mean(scores)),
+        "median_score": float(np.median(scores)),
+        "min_score": float(np.min(scores)),
+        "max_score": float(np.max(scores)),
+        "score_std": float(np.std(scores)),
+        "score_25th": float(np.percentile(scores, 25)),
+        "score_75th": float(np.percentile(scores, 75)),
+        "score_hist": [int(s) for s in scores],
     }
 
-    print("\nEvaluation Results:")
-    print("Actual Scores:")
-    print(
-        f"Mean: {stats['actual_score']['mean']:.1f} ± {stats['actual_score']['std']:.1f}"
-    )
-    print(
-        f"Max: {stats['actual_score']['max']:.1f}, Min: {stats['actual_score']['min']:.1f}"
-    )
-    print("\nTraining Rewards:")
-    print(
-        f"Mean: {stats['training_reward']['mean']:.1f} ± {stats['training_reward']['std']:.1f}"
-    )
-    print(
-        f"Max: {stats['training_reward']['max']:.1f}, Min: {stats['training_reward']['min']:.1f}"
-    )
+    # Reset agent to original state
+    agent.epsilon = old_eps
 
-    return stats
+    return metrics
+
+
+def evaluate_episode(
+    agent: YahtzeeAgent, env: YahtzeeEnv, encoder: StateEncoder
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Run a single evaluation episode and return the score and detailed metrics.
+    """
+    state = env.reset()
+    done = False
+    episode_reward = 0
+
+    # Track detailed metrics
+    metrics = {
+        "rolls_used": 0,
+        "upper_score": 0,
+        "lower_score": 0,
+        "yahtzees": 0,
+        "bonus_achieved": 0,
+    }
+
+    while not done:
+        state_vec = encoder.encode(state, opponent_value=0.5)
+        valid_actions = env.get_valid_actions()
+        action_idx = agent.select_action(state_vec, valid_actions)
+        next_state, reward, done, info = env.step(action_idx)
+
+        # Track metrics based on action
+        if info["action_type"] == "ROLL" or info["action_type"] == "HOLD":
+            metrics["rolls_used"] += 1
+
+        if info.get("category_scored"):
+            category = info["category_scored"]
+            points = info["points_scored"]
+
+            # Track special combinations
+            if category == "YAHTZEE" and points == 50:
+                metrics["yahtzees"] += 1
+
+            # Track upper/lower scores
+            if category in ["ONES", "TWOS", "THREES", "FOURS", "FIVES", "SIXES"]:
+                metrics["upper_score"] += points
+            else:
+                metrics["lower_score"] += points
+
+        episode_reward += reward
+        state = next_state
+
+    # Calculate final metrics
+    upper_score = metrics["upper_score"]
+    if upper_score >= 63:
+        metrics["bonus_achieved"] = 1
+        upper_score += 35
+
+    # Final actual score (not reward-shaped)
+    metrics["total_score"] = upper_score + metrics["lower_score"]
+
+    return episode_reward, metrics
 
 
 def get_latest_checkpoint(run_id: str) -> Optional[str]:
-    models_dir = "models"
+    """
+    Get the path to the latest checkpoint for the given run ID.
+    """
+    checkpoint_dir = os.path.join("models", run_id)
+    if not os.path.exists(checkpoint_dir):
+        return None
+
     checkpoints = [
-        f
-        for f in os.listdir(models_dir)
-        if f.startswith(f"yahtzee_run_{run_id}_checkpoint_")
+        os.path.join(checkpoint_dir, f)
+        for f in os.listdir(checkpoint_dir)
+        if f.endswith(".pth")
     ]
     if not checkpoints:
         return None
 
-    checkpoints.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
-    return os.path.join(models_dir, checkpoints[-1])
+    return max(checkpoints, key=os.path.getmtime)
 
 
 def load_checkpoint(
     checkpoint_path: str, agent: YahtzeeAgent, device: torch.device
 ) -> int:
-    print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
+    """
+    Load agent state from a checkpoint file.
+    Returns the episode number.
+    """
     try:
-        agent.policy_net.load_state_dict(checkpoint["policy_net"])
-        agent.target_net.load_state_dict(checkpoint["target_net"])
-        agent.optimizer.load_state_dict(checkpoint["optimizer"])
-        start_episode = checkpoint["episode"]
-    except KeyError:
-        print("Loading legacy checkpoint format...")
-        agent.policy_net.load_state_dict(checkpoint)
-        agent.target_net.load_state_dict(checkpoint)
-        try:
-            start_episode = int(checkpoint_path.split("_")[-1].split(".")[0])
-        except (ValueError, IndexError):
-            start_episode = 0
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    print(f"Resuming from episode {start_episode}")
-    return start_episode
+        # Check if it's a legacy format checkpoint that needs conversion
+        if not isinstance(checkpoint, dict) or "policy_net" not in checkpoint:
+            legacy_state = checkpoint
+            checkpoint = convert_legacy_model(
+                legacy_state, agent.state_size, agent.action_size, device
+            )
+            agent.policy_net.load_state_dict(checkpoint)
+            agent.target_net.load_state_dict(checkpoint)
+            episode = 0
+        else:
+            agent.policy_net.load_state_dict(checkpoint["policy_net"])
+            agent.target_net.load_state_dict(checkpoint["target_net"])
+            if "optimizer" in checkpoint:
+                agent.optimizer.load_state_dict(checkpoint["optimizer"])
+            if "scheduler" in checkpoint:
+                agent.scheduler.load_state_dict(checkpoint["scheduler"])
+            if "epsilon" in checkpoint:
+                agent.epsilon = checkpoint["epsilon"]
+            if "learn_steps" in checkpoint:
+                agent.learn_steps = checkpoint["learn_steps"]
+            episode = checkpoint.get("episode", 0)
+
+        return episode
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        return 0
 
 
 def save_checkpoint(
@@ -163,399 +204,369 @@ def save_checkpoint(
     metrics: dict,
     is_best: bool = False,
 ) -> str:
-    models_dir = "models"
-    if not os.path.exists(models_dir):
-        os.makedirs(models_dir)
+    """
+    Save a checkpoint of the agent's state.
+    Returns the path to the saved checkpoint.
+    """
+    os.makedirs(os.path.join("models", run_id), exist_ok=True)
 
+    # Only keep a limited number of checkpoints to save space
+    checkpoint_dir = os.path.join("models", run_id)
+    checkpoints = [
+        os.path.join(checkpoint_dir, f)
+        for f in os.listdir(checkpoint_dir)
+        if f.endswith(".pth") and not f.startswith("best_")
+    ]
+
+    # Keep only the 5 most recent checkpoints
+    if len(checkpoints) >= 5:
+        oldest_checkpoint = min(checkpoints, key=os.path.getmtime)
+        os.remove(oldest_checkpoint)
+
+    # Save current checkpoint
+    checkpoint_path = os.path.join("models", run_id, f"checkpoint_{episode:06d}.pth")
+
+    # Save only policy net weights and other essential info to save space
     checkpoint = {
-        "episode": episode,
         "policy_net": agent.policy_net.state_dict(),
         "target_net": agent.target_net.state_dict(),
         "optimizer": agent.optimizer.state_dict(),
         "scheduler": agent.scheduler.state_dict(),
-        "metrics": metrics,
         "epsilon": agent.epsilon,
+        "episode": episode,
+        "learn_steps": agent.learn_steps,
+        "metrics": metrics,
     }
 
-    if is_best:
-        score = int(metrics["eval_score"])
-        filename = f"{models_dir}/yahtzee_run_{run_id}_best_eval{score}.pth"
-    else:
-        filename = f"{models_dir}/yahtzee_run_{run_id}_checkpoint_{episode}.pth"
+    torch.save(checkpoint, checkpoint_path)
 
-    torch.save(checkpoint, filename)
-    print(f"Saved model to: {filename}")
-    return filename
+    # If this is the best model, save a copy
+    if is_best:
+        best_path = os.path.join("models", run_id, "best_model.pth")
+        torch.save(checkpoint, best_path)
+
+    return checkpoint_path
 
 
 def train(
     run_id: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
     num_episodes: int = 100000,
-    num_envs: int = 64,
+    num_envs: int = 128,
     steps_per_update: int = 8,
-    checkpoint_freq: int = 100,
-    eval_freq: int = 50,
+    checkpoint_freq: int = 500,
+    eval_freq: int = 100,
     num_eval_episodes: int = 50,
     min_improvement: float = 1.0,
     objective: str = "win",
+    use_wandb: bool = True,
+    wandb_project: str = "yahtzee-rl",
+    use_enhanced_rewards: bool = True,
+    batch_size: int = 2048,
+    use_noisy: bool = True,
+    learning_rate: float = 1e-4,
 ) -> None:
+    """
+    Train the DQN agent using vectorized environments.
+    """
+    # Set up device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Enable cudnn benchmark for faster training on A100
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
+    # Create run ID if not provided
     if run_id is None:
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = f"yahtzee_{timestamp}"
 
-    config = {
-        "num_episodes": num_episodes,
-        "num_envs": num_envs,
-        "steps_per_update": steps_per_update,
-        "checkpoint_freq": checkpoint_freq,
-        "eval_freq": eval_freq,
-        "num_eval_episodes": num_eval_episodes,
-        "min_improvement": min_improvement,
-        "objective": objective,
-    }
+    # Set up wandb
+    if use_wandb:
+        wandb.init(
+            project=wandb_project,
+            name=run_id,
+            config={
+                "num_episodes": num_episodes,
+                "num_envs": num_envs,
+                "steps_per_update": steps_per_update,
+                "checkpoint_freq": checkpoint_freq,
+                "eval_freq": eval_freq,
+                "num_eval_episodes": num_eval_episodes,
+                "min_improvement": min_improvement,
+                "objective": objective,
+                "batch_size": batch_size,
+                "use_noisy": use_noisy,
+                "learning_rate": learning_rate,
+                "use_enhanced_rewards": use_enhanced_rewards,
+                "device": str(device),
+            },
+        )
 
-    wandb.init(
-        project="yahtzee-rl",
-        name=f"yahtzee_run_{run_id}",
-        config=config,
-        resume=checkpoint_path is not None,
+    # Create environments
+    reward_strategy = (
+        RewardStrategy.ENHANCED if use_enhanced_rewards else RewardStrategy.STRATEGIC
     )
-
-    # Switch to potential-based if objective == "win"
-    reward_strat = (
-        RewardStrategy.POTENTIAL if objective == "win" else RewardStrategy.STRATEGIC
-    )
-
-    envs = [YahtzeeEnv(reward_strategy=reward_strat) for _ in range(num_envs)]
-    encoders = [
-        StateEncoder(use_opponent_value=(objective == "win")) for _ in range(num_envs)
+    envs = [
+        YahtzeeEnv(
+            use_opponent_value=(objective == "win"),
+            reward_strategy=reward_strategy,
+        )
+        for _ in range(num_envs)
     ]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Create encoder
+    encoder = StateEncoder(use_opponent_value=(objective == "win"))
 
+    # Create agent
     agent = YahtzeeAgent(
-        state_size=encoders[0].state_size,
-        action_size=NUM_ACTIONS,
-        batch_size=1024,
-        gamma=0.99,
-        learning_rate=2e-4,
+        state_size=encoder.state_size,
+        action_size=46,  # Fixed size based on action space
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        gamma=0.997,
         target_update=50,
         device=device,
-        min_epsilon=0.02,
-        epsilon_decay=0.9992,
-        n_step=3,
+        use_noisy=use_noisy,
     )
 
+    # Load checkpoint if provided
     start_episode = 0
-    final_episode = start_episode
-    metrics = {
-        "best_eval_score": float("-inf"),
-        "episode_rewards": [],
-        "eval_scores": [],
-        "losses": [],
-    }
-
-    if checkpoint_path:
+    if checkpoint_path is not None:
         start_episode = load_checkpoint(checkpoint_path, agent, device)
-        final_episode = start_episode
-        checkpoint_loaded = torch.load(checkpoint_path, map_location=device)
-        metrics.update(checkpoint_loaded.get("metrics", {}))
+    elif run_id is not None:
+        latest_checkpoint = get_latest_checkpoint(run_id)
+        if latest_checkpoint is not None:
+            start_episode = load_checkpoint(latest_checkpoint, agent, device)
 
-    last_save_time = time.time()
-    progress = tqdm(range(start_episode, num_episodes), desc="Training")
+    # Initialize environment states
+    states = [env.reset() for env in envs]
 
-    try:
-        for episode in progress:
-            final_episode = episode
-            episode_rewards = []
-            episode_losses = []
-            actual_scores = []
+    # Tracking metrics
+    best_score = 0
+    scores_history = []
+    learning_rates = []
 
-            states = [env.reset() for env in envs]
-            dones = [False] * num_envs
-            total_rewards = [0.0] * num_envs
+    # Progress bar
+    progress_bar = tqdm(
+        range(start_episode, num_episodes),
+        desc=f"Episode {start_episode}/{num_episodes}",
+        unit="episode",
+    )
 
-            for _ in range(steps_per_update):
-                active_indices = [i for i, done in enumerate(dones) if not done]
-                if not active_indices:
-                    break
+    # Training loop
+    for episode in progress_bar:
+        episode_steps = 0
+        episode_rewards = np.zeros(num_envs)
 
-                state_vecs = np.stack(
-                    [
-                        encoders[i].encode(
-                            states[i], opponent_value=0.5 if objective == "win" else 0.0
-                        )
-                        for i in active_indices
-                    ]
-                )
-                valid_actions_list = [
-                    envs[i].get_valid_actions() for i in active_indices
+        # Sample fresh noise for exploration if using noisy networks
+        if use_noisy:
+            agent.policy_net.sample_noise()
+
+        # Episode loop
+        while episode_steps < steps_per_update:
+            # Encode states
+            state_vecs = np.stack(
+                [
+                    encoder.encode(s, opponent_value=0.5 if objective == "win" else 0.0)
+                    for s in states
                 ]
-                if not all(valid_actions_list):
-                    continue
+            )
 
-                actions = agent.select_actions_batch(state_vecs, valid_actions_list)
+            # Get actions
+            valid_actions_list = [env.get_valid_actions() for env in envs]
+            actions = agent.select_actions_batch(state_vecs, valid_actions_list)
 
-                next_states = []
-                rewards_ = []
-                new_dones = []
-                for idx, action in zip(active_indices, actions):
-                    ns, rew, dn, info = envs[idx].step(action)
-                    next_states.append(ns)
-                    rewards_.append(rew)
-                    new_dones.append(dn)
-                    total_rewards[idx] += rew
-                    states[idx] = ns
-                    dones[idx] = dn
-                    if dn and "final_score" in info:
-                        actual_scores.append(info["final_score"])
+            # Step environments
+            next_states = []
+            rewards = []
+            dones = []
 
-                agent.train_step_batch(
-                    [encoders[a].encode(states[a], opponent_value=0.5 if objective == "win" else 0.0) for a in active_indices],
-                    actions,
-                    rewards_,
-                    [encoders[idx].encode(next_states[i], opponent_value=0.5 if objective == "win" else 0.0) for i, idx in enumerate(active_indices)],
-                    new_dones,
-                    env_indices=active_indices
-                )
-                
-                # Track the loss from the training step
-                if agent.latest_loss is not None:
-                    episode_losses.append(agent.latest_loss)
+            for i, (env, action) in enumerate(zip(envs, actions)):
+                next_state, reward, done, _ = env.step(action)
+                next_states.append(next_state)
+                rewards.append(reward)
+                dones.append(done)
+                episode_rewards[i] += reward
 
-            episode_rewards.extend(total_rewards)
-            metrics["episode_rewards"].extend(episode_rewards)
-            if episode_losses:
-                metrics["losses"].extend(episode_losses)
-                mean_loss = np.mean(episode_losses)
-            else:
-                mean_loss = 0.0
+                # Reset if done
+                if done:
+                    next_states[i] = env.reset()
 
-            mean_reward = np.mean(episode_rewards)
-            mean_actual_score = np.mean(actual_scores) if actual_scores else None
+            # Store transitions and update agent
+            loss = agent.train_step_batch(
+                state_vecs,
+                actions,
+                rewards,
+                [
+                    encoder.encode(s, opponent_value=0.5 if objective == "win" else 0.0)
+                    for s in next_states
+                ],
+                dones,
+            )
 
-            # Log training metrics
-            log_dict = {
+            # Update states
+            states = next_states
+            episode_steps += 1
+
+        # Calculate metrics for logging
+        mean_reward = np.mean(episode_rewards)
+        max_reward = np.max(episode_rewards)
+        min_reward = np.min(episode_rewards)
+
+        # Get current learning rate
+        current_lr = agent.scheduler.get_last_lr()[0]
+        learning_rates.append(current_lr)
+
+        # Update progress bar
+        metrics_dict = agent.get_metrics()
+        progress_bar.set_description(
+            f"Episode {episode}/{num_episodes} | "
+            f"Reward: {mean_reward:.1f} | "
+            f"Loss: {metrics_dict.get('loss', 0):.3f} | "
+            f"LR: {current_lr:.1e}"
+        )
+
+        # Log to wandb
+        if use_wandb:
+            wandb_dict = {
                 "episode": episode,
-                "reward": mean_reward,
+                "reward_mean": mean_reward,
+                "reward_max": max_reward,
+                "reward_min": min_reward,
                 "epsilon": agent.epsilon,
-                "learning_rate": agent.optimizer.param_groups[0]["lr"],
-                "buffer_size": len(agent.buffer),
+                "learning_rate": current_lr,
             }
-            
-            if agent.latest_loss is not None:
-                log_dict["loss"] = agent.latest_loss
-            
-            if mean_actual_score is not None:
-                log_dict["actual_score"] = mean_actual_score
+            wandb_dict.update(metrics_dict)  # Add all metrics from agent
+            wandb.log(wandb_dict, step=episode)
 
-            wandb.log(log_dict, step=episode)
+        # Evaluation
+        if episode > 0 and episode % eval_freq == 0:
+            print(f"\nEvaluating agent at episode {episode}...")
+            eval_metrics = evaluate_agent(
+                agent, num_games=num_eval_episodes, objective=objective
+            )
 
-            if len(metrics["episode_rewards"]) >= 100:
-                mean_100 = np.mean(metrics["episode_rewards"][-100:])
-                best_score = metrics["best_eval_score"]
-                progress.set_postfix(
-                    {
-                        "Mean100": f"{mean_100:.1f}",
-                        "Best": f"{best_score:.1f}",
-                        "Buffer": f"{len(agent.buffer)}",
-                        "Loss": f"{mean_loss:.3f}" if mean_loss > 0 else "N/A",
-                    }
+            mean_score = eval_metrics["mean_score"]
+            median_score = eval_metrics["median_score"]
+            scores_history.append(mean_score)
+
+            # Update best score and save model if improved
+            if mean_score > best_score + min_improvement:
+                best_score = mean_score
+                print(
+                    f"New best score: {best_score:.1f} (improved by {mean_score - best_score + min_improvement:.1f})"
                 )
+                save_checkpoint(agent, episode, run_id, eval_metrics, is_best=True)
 
-            if (episode + 1) % eval_freq == 0 and len(agent.buffer) >= agent.batch_size:
-                eval_stats = evaluate_agent(agent, num_eval_episodes, objective)
-                mean_eval_score = eval_stats["actual_score"]["mean"]
-                mean_eval_reward = eval_stats["training_reward"]["mean"]
-                metrics["eval_scores"].append(mean_eval_score)
-                metrics["eval_score"] = mean_eval_score
+            # Display evaluation results
+            print(f"Mean score: {mean_score:.1f}")
+            print(f"Median score: {median_score:.1f}")
+            print(f"Min score: {eval_metrics['min_score']:.1f}")
+            print(f"Max score: {eval_metrics['max_score']:.1f}")
 
+            # Log evaluation metrics to wandb
+            if use_wandb:
+                eval_dict = {
+                    f"eval_{k}": v for k, v in eval_metrics.items() if k != "score_hist"
+                }
+                wandb.log(eval_dict, step=episode)
+
+                # Log score distribution as histogram
+                scores = eval_metrics["score_hist"]
                 wandb.log(
-                    {
-                        "eval_score": mean_eval_score,
-                        "eval_score_std": eval_stats["actual_score"]["std"],
-                        "eval_reward": mean_eval_reward,
-                        "eval_reward_std": eval_stats["training_reward"]["std"],
-                    },
-                    step=episode,
+                    {"eval_score_histogram": wandb.Histogram(scores)}, step=episode
                 )
 
-                if mean_eval_score > metrics["best_eval_score"] + min_improvement:
-                    metrics["best_eval_score"] = mean_eval_score
-                    filename = save_checkpoint(agent, episode, run_id, metrics, True)
-                    wandb.save(filename)
-                    print(
-                        f"\nNew best eval score: {mean_eval_score:.1f} (reward: {mean_eval_reward:.1f})"
-                    )
+        # Checkpoint saving
+        if episode > 0 and episode % checkpoint_freq == 0:
+            save_path = save_checkpoint(agent, episode, run_id, {})
+            print(f"\nCheckpoint saved to {save_path}")
 
-            current_time = time.time()
-            if current_time - last_save_time >= 1800:
-                filename = save_checkpoint(agent, episode + 1, run_id, metrics)
-                last_save_time = current_time
+    # Final evaluation
+    print("\nFinal evaluation...")
+    final_metrics = evaluate_agent(agent, num_games=100, objective=objective)
 
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
-        final_episode = episode if 'episode' in locals() else start_episode
-    except Exception as e:
-        print(f"\nError during training: {str(e)}")
-        final_episode = episode if 'episode' in locals() else start_episode
-        raise
-    finally:
-        try:
-            print("\nSaving final model...")
-            final_metrics = {
-                **metrics,
-                "final_mean_reward": np.mean(metrics["episode_rewards"][-100:])
-                if len(metrics["episode_rewards"]) >= 100
-                else np.mean(metrics["episode_rewards"]),
-            }
-            filename = save_checkpoint(agent, final_episode + 1, run_id, final_metrics)
-            print(f"Final model saved to: {filename}")
-        except Exception as e:
-            print(f"Error saving final model: {str(e)}")
+    # Save final model
+    final_path = save_checkpoint(agent, num_episodes, run_id, final_metrics)
+    print(f"Final model saved to {final_path}")
 
-        if wandb.run is not None:
-            wandb.finish()
+    # Print final results
+    print("\nTraining completed!")
+    print(f"Final mean score: {final_metrics['mean_score']:.1f}")
+    print(f"Final median score: {final_metrics['median_score']:.1f}")
+
+    # Close wandb
+    if use_wandb:
+        wandb.finish()
+
+    # Plot training progress
+    if len(scores_history) > 0:
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(eval_freq, num_episodes + 1, eval_freq), scores_history)
+        plt.title("Training Progress")
+        plt.xlabel("Episode")
+        plt.ylabel("Mean Score")
+        plt.grid(True)
+        plt.savefig(os.path.join("models", run_id, "training_progress.png"))
+        plt.close()
 
 
-def evaluate_episode(
-    agent: YahtzeeAgent, env: YahtzeeEnv, encoder: StateEncoder
-) -> float:
+def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
+    """Run a full game simulation and optionally render the state at each step."""
+    env = YahtzeeEnv()
+    encoder = StateEncoder(use_opponent_value=True)  # Match training
     state = env.reset()
     total_reward = 0
     done = False
+    turn = 1
 
+    # Store original epsilon and set to minimum for deterministic play
     old_eps = agent.epsilon
     agent.epsilon = 0.02
 
     while not done:
-        state_vec = encoder.encode(state)
-        valid_actions = env.get_valid_actions()
-        if not valid_actions:
-            break
+        if render:
+            print(f"\n=== Turn {turn} ===")
+            print(env.render())
 
+        state_vec = encoder.encode(state, opponent_value=0.5)
+        valid_actions = env.get_valid_actions()
         action_idx = agent.select_action(state_vec, valid_actions)
+        action = env.action_mapper.index_to_action(action_idx)
+
         state, reward, done, _ = env.step(action_idx)
         total_reward += reward
 
-    agent.epsilon = old_eps
-    return total_reward
-
-
-def simulate_game(agent: YahtzeeAgent, render: bool = True) -> float:
-    env = YahtzeeEnv()
-    encoder = StateEncoder()
-    state = env.reset()
-    done = False
-    turn = 1
-
-    old_eps = agent.epsilon
-    agent.epsilon = 0.01
-
-    while not done:
         if render:
-            upper_total = sum(
-                state.score_sheet[cat] or 0
-                for cat in [
-                    YahtzeeCategory.ONES,
-                    YahtzeeCategory.TWOS,
-                    YahtzeeCategory.THREES,
-                    YahtzeeCategory.FOURS,
-                    YahtzeeCategory.FIVES,
-                    YahtzeeCategory.SIXES,
-                ]
-            )
-            bonus = 35 if upper_total >= 63 else 0
-            lower_total = sum(
-                state.score_sheet[cat] or 0
-                for cat in [
-                    YahtzeeCategory.THREE_OF_A_KIND,
-                    YahtzeeCategory.FOUR_OF_A_KIND,
-                    YahtzeeCategory.FULL_HOUSE,
-                    YahtzeeCategory.SMALL_STRAIGHT,
-                    YahtzeeCategory.LARGE_STRAIGHT,
-                    YahtzeeCategory.YAHTZEE,
-                    YahtzeeCategory.CHANCE,
-                ]
-            )
-            actual_score = upper_total + bonus + lower_total
-
-            clear_output(wait=True)
-            print(f"\n=== Turn {turn} | Score: {actual_score} ===")
-            print(env.render())
-
-        state_vec = encoder.encode(state)
-        valid_actions = env.get_valid_actions()
-        if not valid_actions:
-            break
-
-        action_idx = agent.select_action(state_vec, valid_actions)
-        action = IDX_TO_ACTION[action_idx]
-
-        if render:
-            print("\nAgent's decision:")
             if action.kind == ActionType.ROLL:
-                print("Action: ROLL all dice")
+                print("Action: ROLL")
             elif action.kind == ActionType.HOLD:
                 held = [i + 1 for i, hold in enumerate(action.data) if hold]
-                if held:
-                    print(f"Action: Hold dice at positions {held}")
-                else:
-                    print("Action: ROLL all dice")
+                print(f"Action: HOLD {held}")
             else:
-                points = env.calc_score(action.data, state.current_dice)
-                print(f"Action: Score {action.data.name} for {points} points")
+                print(f"Action: SCORE {action.data.name} for {reward:.1f}")
 
-        state, reward, done, _ = env.step(action_idx)
-        if render and action.kind == ActionType.SCORE:
-            points = env.calc_score(action.data, state.current_dice)
-            print(f"Scored {points} points")
-            turn += 1
-
-    upper_total = sum(
-        state.score_sheet[cat] or 0
-        for cat in [
-            YahtzeeCategory.ONES,
-            YahtzeeCategory.TWOS,
-            YahtzeeCategory.THREES,
-            YahtzeeCategory.FOURS,
-            YahtzeeCategory.FIVES,
-            YahtzeeCategory.SIXES,
-        ]
-    )
-    bonus = 35 if upper_total >= 63 else 0
-    lower_total = sum(
-        state.score_sheet[cat] or 0
-        for cat in [
-            YahtzeeCategory.THREE_OF_A_KIND,
-            YahtzeeCategory.FOUR_OF_A_KIND,
-            YahtzeeCategory.FULL_HOUSE,
-            YahtzeeCategory.SMALL_STRAIGHT,
-            YahtzeeCategory.LARGE_STRAIGHT,
-            YahtzeeCategory.YAHTZEE,
-            YahtzeeCategory.CHANCE,
-        ]
-    )
-    actual_score = upper_total + bonus + lower_total
+            if action.kind == ActionType.SCORE:
+                turn += 1
 
     if render:
-        clear_output(wait=True)
         print("\n=== Game Over ===")
         print(env.render())
-        print(f"\nFinal Score: {actual_score}")
-        print(f"• Upper Section: {upper_total}")
-        print(f"• Upper Bonus: {bonus}")
-        print(f"• Lower Section: {lower_total}")
+        print(f"Final score: {total_reward:.1f}")
 
+    # Restore original epsilon
     agent.epsilon = old_eps
-    return actual_score, reward
+    return total_reward
 
 
 def show_action_values(
     agent: YahtzeeAgent, state: Optional[GameState] = None, num_top: int = 5
 ) -> tuple:
+    """Show expected values for all valid actions in the current state."""
     env = YahtzeeEnv()
-    encoder = StateEncoder()
+    encoder = StateEncoder(use_opponent_value=True)
 
     if state is None:
         state = env.reset()
@@ -563,67 +574,99 @@ def show_action_values(
     print("\nCurrent Game State:")
     print(env.render())
 
-    state_vec = encoder.encode(state)
+    state_vec = encoder.encode(state, opponent_value=0.5)
     valid_actions = env.get_valid_actions()
 
+    # Get Q-values and mask invalid actions
     q_values = agent.get_q_values(state_vec)
     mask = np.full(agent.action_size, float("-inf"))
     mask[valid_actions] = 0
     q_values = q_values + mask
 
+    # Sort actions by Q-value
     valid_q = [(i, q_values[i]) for i in valid_actions]
     valid_q.sort(key=lambda x: x[1], reverse=True)
 
-    print("\nTop Actions and Their Expected Values:")
+    print("\nTop Actions and Expected Values:")
     for i, (action_idx, value) in enumerate(valid_q[:num_top], 1):
-        action = IDX_TO_ACTION[action_idx]
+        action = env.action_mapper.index_to_action(action_idx)
         if action.kind == ActionType.ROLL:
-            print(f"{i}. ROLL all dice (EV: {value:.1f})")
+            print(f"{i}. Roll all dice (EV: {value:.1f})")
         elif action.kind == ActionType.HOLD:
-            held = [d_i + 1 for d_i, hold in enumerate(action.data) if hold]
-            if held:
-                print(f"{i}. Hold dice {held} (EV: {value:.1f})")
-            else:
-                print(f"{i}. ROLL all dice (EV: {value:.1f})")
+            held = [i + 1 for i, hold in enumerate(action.data) if hold]
+            print(f"{i}. Hold {held} (EV: {value:.1f})")
         else:
-            points = env.calc_score(action.data, state.current_dice)
-            print(
-                f"{i}. Score {action.data.name} for {points} points (EV: {value:.1f})"
-            )
+            print(f"{i}. Score {action.data.name} (EV: {value:.1f})")
 
     return state, valid_q[:num_top]
 
 
 def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Train Yahtzee DQN agent (Gym-based)")
-    parser.add_argument("--run_id", type=str, help="Run ID for resuming training")
-    parser.add_argument(
-        "--episodes", type=int, default=50000, help="Number of episodes"
-    )
+    parser = argparse.ArgumentParser(description="Yahtzee DQN Training")
+    parser.add_argument("--run-id", type=str, help="Run ID for continuing training")
     parser.add_argument(
         "--checkpoint", type=str, help="Path to checkpoint to resume from"
     )
     parser.add_argument(
-        "--num_envs", type=int, default=32, help="Number of parallel environments"
+        "--episodes", type=int, default=100000, help="Number of episodes to train for"
+    )
+    parser.add_argument(
+        "--envs", type=int, default=128, help="Number of parallel environments"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=2048, help="Batch size for training"
+    )
+    parser.add_argument(
+        "--eval-freq", type=int, default=100, help="Frequency of evaluation"
+    )
+    parser.add_argument(
+        "--checkpoint-freq", type=int, default=500, help="Frequency of checkpointing"
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=50,
+        help="Number of episodes for evaluation",
     )
     parser.add_argument(
         "--objective",
         type=str,
-        default="avg_score",  # changed default
         choices=["win", "avg_score"],
-        help="Training objective (win or avg_score)",
+        default="win",
+        help="Training objective",
     )
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument(
+        "--no-noisy", action="store_true", help="Disable noisy networks"
+    )
+    parser.add_argument(
+        "--no-enhanced-rewards",
+        action="store_true",
+        help="Use strategic rewards instead of enhanced",
+    )
+
     args = parser.parse_args()
+
+    # Ensure models directory exists
+    os.makedirs("models", exist_ok=True)
 
     train(
         run_id=args.run_id,
         checkpoint_path=args.checkpoint,
         num_episodes=args.episodes,
-        num_envs=args.num_envs,
+        num_envs=args.envs,
+        checkpoint_freq=args.checkpoint_freq,
+        eval_freq=args.eval_freq,
+        num_eval_episodes=args.eval_episodes,
         objective=args.objective,
+        use_wandb=not args.no_wandb,
+        batch_size=args.batch_size,
+        use_noisy=not args.no_noisy,
+        learning_rate=args.lr,
+        use_enhanced_rewards=not args.no_enhanced_rewards,
     )
+
 
 if __name__ == "__main__":
     main()
