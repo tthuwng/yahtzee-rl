@@ -46,13 +46,18 @@ def select_model() -> str:
             if 1 <= choice <= len(models):
                 return models[choice - 1]
             else:
-                print(f"Please enter a number between 1 and {len(models)}")
+                print(
+                    f"Please enter a number between 1 and {len(models)}"
+                )
         except ValueError:
             print("Please enter a valid number")
 
 
 def convert_legacy_model(
-    legacy_state: dict, state_size: int, action_size: int, device: torch.device
+    legacy_state: dict,
+    state_size: int,
+    action_size: int,
+    device: torch.device,
 ) -> dict:
     """Convert legacy model state dict to new architecture format."""
     new_state = {}
@@ -63,42 +68,81 @@ def convert_legacy_model(
 
     try:
         # Input layer
-        new_state["input_layer.0.weight"] = legacy_state["features.0.weight"].clone()
-        new_state["input_layer.0.bias"] = legacy_state["features.0.bias"].clone()
-        new_state["input_layer.2.weight"] = legacy_state["features.2.weight"].clone()
-        new_state["input_layer.2.bias"] = legacy_state["features.2.bias"].clone()
+        new_state["input_layer.0.weight"] = legacy_state[
+            "features.0.weight"
+        ].clone()
+        new_state["input_layer.0.bias"] = legacy_state[
+            "features.0.bias"
+        ].clone()
+        new_state["input_layer.2.weight"] = legacy_state[
+            "features.2.weight"
+        ].clone()
+        new_state["input_layer.2.bias"] = legacy_state[
+            "features.2.bias"
+        ].clone()
 
-        for block_num, prefix in [(1, "res_block1"), (2, "res_block2")]:
+        for block_num, prefix in [
+            (1, "res_block1"),
+            (2, "res_block2"),
+        ]:
             # First layer of residual block
-            new_state[f"{prefix}.0.weight"] = legacy_state["features.3.weight"].clone()
-            new_state[f"{prefix}.0.bias"] = legacy_state["features.3.bias"].clone()
-            new_state[f"{prefix}.2.weight"] = legacy_state["features.5.weight"].clone()
-            new_state[f"{prefix}.2.bias"] = legacy_state["features.5.bias"].clone()
+            new_state[f"{prefix}.0.weight"] = legacy_state[
+                "features.3.weight"
+            ].clone()
+            new_state[f"{prefix}.0.bias"] = legacy_state[
+                "features.3.bias"
+            ].clone()
+            new_state[f"{prefix}.2.weight"] = legacy_state[
+                "features.5.weight"
+            ].clone()
+            new_state[f"{prefix}.2.bias"] = legacy_state[
+                "features.5.bias"
+            ].clone()
 
             # Second layer with size adjustment
-            old_weight = legacy_state["features.6.weight"]  # [256, 512]
+            old_weight = legacy_state[
+                "features.6.weight"
+            ]  # [256, 512]
             old_bias = legacy_state["features.6.bias"]  # [256]
 
             # Expand to [512, 512] by repeating
-            new_state[f"{prefix}.3.weight"] = torch.cat([old_weight, old_weight], dim=0)
-            new_state[f"{prefix}.3.bias"] = torch.cat([old_bias, old_bias], dim=0)
+            new_state[f"{prefix}.3.weight"] = torch.cat(
+                [old_weight, old_weight], dim=0
+            )
+            new_state[f"{prefix}.3.bias"] = torch.cat(
+                [old_bias, old_bias], dim=0
+            )
 
             # Layer norm weights/bias
             old_weight = legacy_state["features.8.weight"]  # [256]
             old_bias = legacy_state["features.8.bias"]  # [256]
 
             # Expand to [512] by repeating
-            new_state[f"{prefix}.5.weight"] = torch.cat([old_weight, old_weight], dim=0)
-            new_state[f"{prefix}.5.bias"] = torch.cat([old_bias, old_bias], dim=0)
+            new_state[f"{prefix}.5.weight"] = torch.cat(
+                [old_weight, old_weight], dim=0
+            )
+            new_state[f"{prefix}.5.bias"] = torch.cat(
+                [old_bias, old_bias], dim=0
+            )
 
         # Output layer
-        new_state["output_layer.0.weight"] = legacy_state["features.6.weight"].clone()
-        new_state["output_layer.0.bias"] = legacy_state["features.6.bias"].clone()
-        new_state["output_layer.2.weight"] = legacy_state["features.8.weight"].clone()
-        new_state["output_layer.2.bias"] = legacy_state["features.8.bias"].clone()
+        new_state["output_layer.0.weight"] = legacy_state[
+            "features.6.weight"
+        ].clone()
+        new_state["output_layer.0.bias"] = legacy_state[
+            "features.6.bias"
+        ].clone()
+        new_state["output_layer.2.weight"] = legacy_state[
+            "features.8.weight"
+        ].clone()
+        new_state["output_layer.2.bias"] = legacy_state[
+            "features.8.bias"
+        ].clone()
 
         # Value stream
-        old_value_weight = legacy_state["value_stream.0.weight"]  # [128, 256]
+        old_value_weight = legacy_state[
+            "value_stream.0.weight"
+        ]  # [128, 256]
         old_value_bias = legacy_state["value_stream.0.bias"]  # [128]
 
         # Expand to new sizes
@@ -120,12 +164,20 @@ def convert_legacy_model(
         # Final value layer with size adjustment
         old_weight = legacy_state["value_stream.2.weight"]  # [1, 128]
         # Expand to [1, 256] by repeating
-        new_state["value_stream.3.weight"] = torch.cat([old_weight, old_weight], dim=1)
-        new_state["value_stream.3.bias"] = legacy_state["value_stream.2.bias"].clone()
+        new_state["value_stream.3.weight"] = torch.cat(
+            [old_weight, old_weight], dim=1
+        )
+        new_state["value_stream.3.bias"] = legacy_state[
+            "value_stream.2.bias"
+        ].clone()
 
         # Advantage stream
-        old_adv_weight = legacy_state["advantage_stream.0.weight"]  # [128, 256]
-        old_adv_bias = legacy_state["advantage_stream.0.bias"]  # [128]
+        old_adv_weight = legacy_state[
+            "advantage_stream.0.weight"
+        ]  # [128, 256]
+        old_adv_bias = legacy_state[
+            "advantage_stream.0.bias"
+        ]  # [128]
 
         # Expand to new sizes
         new_state["advantage_stream.0.weight"] = torch.cat(
@@ -144,7 +196,9 @@ def convert_legacy_model(
         )
 
         # Final advantage layer with size adjustment
-        old_weight = legacy_state["advantage_stream.2.weight"]  # [46, 128]
+        old_weight = legacy_state[
+            "advantage_stream.2.weight"
+        ]  # [46, 128]
         # Expand to [46, 256] by repeating
         new_state["advantage_stream.3.weight"] = torch.cat(
             [old_weight, old_weight], dim=1
@@ -167,10 +221,12 @@ def load_agent(
         model_path = select_model()
 
     print(f"Loading model from {model_path}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
 
     # Create encoder first to get state size
-    encoder = StateEncoder(use_opponent_value=(objective == "win"))
+    encoder = StateEncoder(use_opponent_value=False)
 
     # Initialize agent with appropriate parameters
     agent = YahtzeeAgent(
@@ -179,8 +235,8 @@ def load_agent(
         batch_size=2048,
         gamma=0.997,
         learning_rate=1e-4,
-        device=device,
-        use_noisy=True,  # Default to noisy networks for better exploration
+        target_update=50,
+        device=str(device),
     )
 
     # Load model weights
@@ -188,8 +244,20 @@ def load_agent(
         checkpoint = torch.load(model_path, map_location=device)
 
         # If checkpoint is a dictionary with keys, use the new format
-        if isinstance(checkpoint, dict) and "policy_net" in checkpoint:
+        if (
+            isinstance(checkpoint, dict)
+            and "policy_net" in checkpoint
+        ):
             agent.policy_net.load_state_dict(checkpoint["policy_net"])
+            agent.target_net.load_state_dict(checkpoint["target_net"])
+            if "optimizer" in checkpoint:
+                agent.optimizer.load_state_dict(
+                    checkpoint["optimizer"]
+                )
+            if "epsilon" in checkpoint:
+                agent.epsilon = checkpoint["epsilon"]
+            if "learn_steps" in checkpoint:
+                agent.learn_steps = checkpoint["learn_steps"]
             print("Loaded model in new checkpoint format")
         else:
             # Try to load as legacy format
@@ -197,6 +265,7 @@ def load_agent(
                 checkpoint, encoder.state_size, 46, device
             )
             agent.policy_net.load_state_dict(converted_state)
+            agent.target_net.load_state_dict(converted_state)
             print("Loaded and converted legacy model format")
 
         # Put the agent in evaluation mode
@@ -213,8 +282,10 @@ def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> float:
     Run a full game simulation with visualization.
     Returns the final score.
     """
-    env = YahtzeeEnv(reward_strategy=RewardStrategy.ENHANCED)
-    encoder = StateEncoder(use_opponent_value=True)  # Set to match training
+    env = YahtzeeEnv(reward_strategy=RewardStrategy.STRATEGIC)
+    encoder = StateEncoder(
+        use_opponent_value=False
+    )  # Set to match training
     state = env.reset()
     total_reward = 0
     done = False
@@ -223,10 +294,6 @@ def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> float:
     # Store original epsilon and set to minimum for deterministic play
     old_eps = agent.epsilon
     agent.epsilon = 0.02
-
-    # Sample new noise if using noisy networks
-    if hasattr(agent.policy_net, "use_noisy") and agent.policy_net.use_noisy:
-        agent.policy_net.sample_noise()
 
     while not done:
         # Calculate current score
@@ -250,7 +317,7 @@ def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> float:
         print(env.render())
 
         # Get agent's action
-        state_vec = encoder.encode(state, opponent_value=0.5)
+        state_vec = encoder.encode(state)
         valid_actions = env.get_valid_actions()
         action_idx = agent.select_action(state_vec, valid_actions)
         action = env.action_mapper.index_to_action(action_idx)
@@ -260,9 +327,13 @@ def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> float:
         if action.kind == ActionType.ROLL:
             print("Action: ROLL all dice")
         elif action.kind == ActionType.HOLD:
-            held = [i + 1 for i, hold in enumerate(action.data) if hold]
+            held = [
+                i + 1 for i, hold in enumerate(action.data) if hold
+            ]
             if held:
-                held_values = [state.current_dice[i - 1] for i in held]
+                held_values = [
+                    state.current_dice[i - 1] for i in held
+                ]
                 print(
                     f"Action: Hold {', '.join(f'{pos}({val})' for pos, val in zip(held, held_values))}"
                 )
@@ -270,7 +341,9 @@ def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> float:
                 print("Action: ROLL all dice")
         else:
             points = env.calc_score(action.data, state.current_dice)
-            print(f"Action: Score {action.data.name} for {points} points")
+            print(
+                f"Action: Score {action.data.name} for {points} points"
+            )
 
         # Execute the action
         state, reward, done, _ = env.step(action_idx)
@@ -316,14 +389,18 @@ def simulate_game(agent: YahtzeeAgent, delay: float = 0.5) -> float:
 
 
 def show_action_values(
-    agent: YahtzeeAgent, state: Optional[GameState] = None, num_top: int = 5
+    agent: YahtzeeAgent,
+    state: Optional[GameState] = None,
+    num_top: int = 5,
 ) -> tuple:
     """
     Show the agent's expected values for all valid actions in the current state.
     Returns (state, top_actions, q_values)
     """
     env = YahtzeeEnv()
-    encoder = StateEncoder(use_opponent_value=True)  # Set to match training
+    encoder = StateEncoder(
+        use_opponent_value=True
+    )  # Set to match training
 
     if state is None:
         state = env.reset()
@@ -338,7 +415,9 @@ def show_action_values(
 
     # Show dice state
     dice_values = state.current_dice
-    dice_str = " ".join(f"[{d}]" if d > 0 else "[ ]" for d in dice_values)
+    dice_str = " ".join(
+        f"[{d}]" if d > 0 else "[ ]" for d in dice_values
+    )
     print(f"\nDice (Rolls Left: {state.rolls_left})")
     print("Positions: [1] [2] [3] [4] [5]")
     print(f"Values:   {dice_str}")
@@ -355,14 +434,18 @@ def show_action_values(
         if i < 6:  # Upper section
             score_val = score if score is not None else 0
             upper_total += score_val
-            print(f"{cat.name:<12} {score if score is not None else '-':>5}")
+            print(
+                f"{cat.name:<12} {score if score is not None else '-':>5}"
+            )
 
     # Show upper bonus
     bonus = 35 if upper_total >= 63 else 0
     bonus_needed = max(0, 63 - upper_total)
     print("-" * 20)
     print(f"{'Upper Total':<12} {upper_total:>5}")
-    print(f"{'Bonus':<12} {bonus if upper_total >= 63 else f'Need {bonus_needed}':>5}")
+    print(
+        f"{'Bonus':<12} {bonus if upper_total >= 63 else f'Need {bonus_needed}':>5}"
+    )
     print("-" * 20)
 
     # Lower section
@@ -371,19 +454,25 @@ def show_action_values(
         if i >= 6:  # Lower section
             score_val = score if score is not None else 0
             lower_total += score_val
-            print(f"{cat.name:<12} {score if score is not None else '-':>5}")
+            print(
+                f"{cat.name:<12} {score if score is not None else '-':>5}"
+            )
 
     print("-" * 20)
     print(f"{'Lower Total':<12} {lower_total:>5}")
     print("-" * 20)
-    print(f"{'Grand Total':<12} {upper_total + bonus + lower_total:>5}")
+    print(
+        f"{'Grand Total':<12} {upper_total + bonus + lower_total:>5}"
+    )
     print("-" * 20)
 
     # Show dice combinations for reference
     if any(state.current_dice):
         dice_values = state.current_dice
         combinations = []
-        counts = np.bincount(dice_values)[1:] if any(dice_values) else []
+        counts = (
+            np.bincount(dice_values)[1:] if any(dice_values) else []
+        )
 
         if max(counts) if counts.size > 0 else 0 >= 3:
             three_val = np.argmax(counts) + 1
@@ -398,23 +487,36 @@ def show_action_values(
             combinations.append(f"Yahtzee ({yahtzee_val}s)")
 
         # Check for full house
-        if len(counts) >= 2 and sorted(counts, reverse=True)[:2] == [3, 2]:
+        if len(counts) >= 2 and sorted(counts, reverse=True)[:2] == [
+            3,
+            2,
+        ]:
             three_val = np.where(counts == 3)[0][0] + 1
             two_val = np.where(counts == 2)[0][0] + 1
-            combinations.append(f"Full House ({three_val}s over {two_val}s)")
+            combinations.append(
+                f"Full House ({three_val}s over {two_val}s)"
+            )
 
         sorted_unique = np.unique(dice_values)
         for straight in [[1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6]]:
             if all(x in sorted_unique for x in straight):
-                combinations.append(f"Small Straight ({'-'.join(map(str, straight))})")
+                combinations.append(
+                    f"Small Straight ({'-'.join(map(str, straight))})"
+                )
                 break
 
         if len(sorted_unique) == 5 and (
             all(x in sorted_unique for x in [1, 2, 3, 4, 5])
             or all(x in sorted_unique for x in [2, 3, 4, 5, 6])
         ):
-            straight = [1, 2, 3, 4, 5] if sorted_unique[0] == 1 else [2, 3, 4, 5, 6]
-            combinations.append(f"Large Straight ({'-'.join(map(str, straight))})")
+            straight = (
+                [1, 2, 3, 4, 5]
+                if sorted_unique[0] == 1
+                else [2, 3, 4, 5, 6]
+            )
+            combinations.append(
+                f"Large Straight ({'-'.join(map(str, straight))})"
+            )
 
         if combinations:
             print("\nPossible Combinations:")
@@ -437,9 +539,13 @@ def show_action_values(
         if action.kind == ActionType.ROLL:
             print(f"{i}. Roll all dice (EV: {value:.1f})")
         elif action.kind == ActionType.HOLD:
-            held = [i + 1 for i, hold in enumerate(action.data) if hold]
+            held = [
+                i + 1 for i, hold in enumerate(action.data) if hold
+            ]
             if held:
-                held_values = [state.current_dice[i - 1] for i in held]
+                held_values = [
+                    state.current_dice[i - 1] for i in held
+                ]
                 print(
                     f"{i}. Hold {', '.join(f'{pos}({val})' for pos, val in zip(held, held_values))} (EV: {value:.1f})"
                 )
@@ -454,12 +560,14 @@ def show_action_values(
     return state, valid_q[:num_top], q_values
 
 
-def evaluate_performance(agent: YahtzeeAgent, num_games: int = 50) -> None:
+def evaluate_performance(
+    agent: YahtzeeAgent, num_games: int = 50
+) -> None:
     """
     Evaluate agent performance over multiple games and display statistics.
     """
-    env = YahtzeeEnv(reward_strategy=RewardStrategy.ENHANCED)
-    encoder = StateEncoder(use_opponent_value=True)
+    env = YahtzeeEnv(reward_strategy=RewardStrategy.STRATEGIC)
+    encoder = StateEncoder(use_opponent_value=False)
 
     # Store original epsilon
     old_eps = agent.epsilon
@@ -483,7 +591,7 @@ def evaluate_performance(agent: YahtzeeAgent, num_games: int = 50) -> None:
         got_yahtzee = False
 
         while not done:
-            state_vec = encoder.encode(state, opponent_value=0.5)
+            state_vec = encoder.encode(state)
             valid_actions = env.get_valid_actions()
             action_idx = agent.select_action(state_vec, valid_actions)
 
@@ -510,7 +618,11 @@ def evaluate_performance(agent: YahtzeeAgent, num_games: int = 50) -> None:
         upper_bonuses.append(1 if bonus > 0 else 0)
 
         total_score = (
-            sum(score for score in state.score_sheet.values() if score is not None)
+            sum(
+                score
+                for score in state.score_sheet.values()
+                if score is not None
+            )
             + bonus
         )
 
@@ -537,10 +649,14 @@ def evaluate_performance(agent: YahtzeeAgent, num_games: int = 50) -> None:
     ]
     print("\nScore Distribution:")
     for low, high in brackets:
-        count = np.sum((np.array(scores) >= low) & (np.array(scores) < high))
+        count = np.sum(
+            (np.array(scores) >= low) & (np.array(scores) < high)
+        )
         percentage = (count / num_games) * 100
         high_str = f"{high:.0f}" if high != float("inf") else "inf"
-        print(f"• {low:3.0f}-{high_str:>3}: {count:3.0f} games ({percentage:4.1f}%)")
+        print(
+            f"• {low:3.0f}-{high_str:>3}: {count:3.0f} games ({percentage:4.1f}%)"
+        )
 
     # Plot score distribution
     plt.figure(figsize=(12, 6))
@@ -549,7 +665,9 @@ def evaluate_performance(agent: YahtzeeAgent, num_games: int = 50) -> None:
     median_score = np.median(scores)
 
     plt.subplot(1, 2, 1)
-    plt.hist(scores, bins=20, color="blue", alpha=0.7, edgecolor="black")
+    plt.hist(
+        scores, bins=20, color="blue", alpha=0.7, edgecolor="black"
+    )
     plt.axvline(
         mean_score,
         color="red",
@@ -605,7 +723,9 @@ def evaluate_performance(agent: YahtzeeAgent, num_games: int = 50) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Yahtzee RL Interactive Play")
+    parser = argparse.ArgumentParser(
+        description="Yahtzee RL Interactive Play"
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -639,7 +759,9 @@ def main():
 
         print("\nSelect a mode:")
         print("• [1] Simulation Mode - Watch agent play a full game")
-        print("• [2] Calculation Mode - Analyze expected values for each action")
+        print(
+            "• [2] Calculation Mode - Analyze expected values for each action"
+        )
         print(
             f"• [3] Performance Stats - View agent's statistics over {args.num_games} games"
         )
@@ -652,7 +774,9 @@ def main():
         if choice == "1":
             print("\n=== Simulation Mode ===")
             print("Watch the agent play a full game of Yahtzee.")
-            print("The agent will show its decision-making process for each move.")
+            print(
+                "The agent will show its decision-making process for each move."
+            )
             input("Press Enter to start the game...")
             simulate_game(agent)
             input("\nPress Enter to return to menu...")
@@ -665,8 +789,8 @@ def main():
             current_state = None
 
             while True:
-                current_state, valid_actions, q_values = show_action_values(
-                    agent, current_state
+                current_state, valid_actions, q_values = (
+                    show_action_values(agent, current_state)
                 )
 
                 print("\nOptions:")
@@ -674,23 +798,35 @@ def main():
                 print("• [2] Start a new game")
                 print("• [3] Return to main menu")
 
-                subchoice = input("\nEnter your choice (1-3): ").strip()
+                subchoice = input(
+                    "\nEnter your choice (1-3): "
+                ).strip()
 
                 if subchoice == "1":
                     try:
                         action_num = int(
-                            input("\nEnter action number to simulate: ").strip()
+                            input(
+                                "\nEnter action number to simulate: "
+                            ).strip()
                         )
                         if 1 <= action_num <= len(valid_actions):
-                            action_idx = valid_actions[action_num - 1][0]
+                            action_idx = valid_actions[
+                                action_num - 1
+                            ][0]
                             env = YahtzeeEnv()
-                            current_state, reward, done, _ = env.step(action_idx)
+                            current_state, reward, done, _ = env.step(
+                                action_idx
+                            )
 
                             if done:
-                                print(f"\n=== Game Over! Final Score: {reward:.0f} ===")
+                                print(
+                                    f"\n=== Game Over! Final Score: {reward:.0f} ==="
+                                )
                                 break
                         else:
-                            print("\nInvalid action number! Please try again.")
+                            print(
+                                "\nInvalid action number! Please try again."
+                            )
                     except ValueError:
                         print("\nPlease enter a valid number!")
 
@@ -738,18 +874,24 @@ def main():
                 if current_objective != "win":
                     current_objective = "win"
                     agent = load_agent(args.model, current_objective)
-                    print("Objective changed to win rate optimization")
+                    print(
+                        "Objective changed to win rate optimization"
+                    )
                 else:
                     print("Already using win rate optimization")
             else:
                 print("\nInvalid choice! Objective unchanged.")
 
         elif choice == "6":
-            print("\nExiting Yahtzee RL Interactive Interface. Goodbye!")
+            print(
+                "\nExiting Yahtzee RL Interactive Interface. Goodbye!"
+            )
             break
 
         else:
-            print("\nInvalid choice! Please enter a number between 1 and 6.")
+            print(
+                "\nInvalid choice! Please enter a number between 1 and 6."
+            )
 
 
 if __name__ == "__main__":

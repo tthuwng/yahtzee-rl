@@ -6,7 +6,7 @@ import numpy as np
 
 
 class YahtzeeCategory(Enum):
-    """Categories in Yahtzee."""
+    """Basic categories in Yahtzee."""
 
     ONES = auto()
     TWOS = auto()
@@ -24,7 +24,7 @@ class YahtzeeCategory(Enum):
 
 
 class ActionType(Enum):
-    """Types of actions in Yahtzee."""
+    """Basic action types in Yahtzee."""
 
     ROLL = auto()  # Roll all dice
     HOLD = auto()  # Hold some dice
@@ -36,13 +36,9 @@ class Action:
     """Action in Yahtzee game."""
 
     kind: ActionType
-    data: Optional[object] = None  # bool array for HOLD, YahtzeeCategory for SCORE
-
-    def __hash__(self):
-        if self.kind == ActionType.HOLD and self.data is not None:
-            # Convert data to tuple for hashing (mask)
-            return hash((self.kind, tuple(self.data)))
-        return hash((self.kind, self.data))
+    data: Optional[object] = (
+        None  # bool array for HOLD, YahtzeeCategory for SCORE
+    )
 
 
 @dataclass
@@ -51,4 +47,6 @@ class GameState:
 
     current_dice: np.ndarray  # Values of 5 dice
     rolls_left: int  # Rolls remaining this turn
-    score_sheet: Dict[YahtzeeCategory, Optional[int]]  # Category -> score or None
+    score_sheet: Dict[
+        YahtzeeCategory, Optional[int]
+    ]  # Category -> score or None
