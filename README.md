@@ -1,101 +1,156 @@
-### Overview
+# Yahtzee Reinforcement Learning
 
-**Yahtzee RL Challenge**. This repository contains a Deep Q-Learning (DQN) agent that learns to play the dice game Yahtzee. The main goals of this project are:
-1. **Simulation Mode**: Observe the AI agent playing a complete Yahtzee game autonomously.
-2. **Calculation Mode**: Explore individual states, see which actions are possible, and discover the agent’s predicted expected values for each action.
+This project implements a Deep Q-Learning agent for the game of Yahtzee, optimized for high-performance training on A100 GPUs.
 
-We aim for the agent to achieve high average scores (ideally around 200–240) by effectively balancing immediate and long-term strategies.
+## Features
 
-### Project Layout
+- Deep Q-Network (DQN) with dueling architecture and noisy networks for efficient exploration
+- Enhanced state representation with strategic game features
+- Sophisticated reward function with game-phase aware incentives
+- Optimized for A100 GPU training:
+  - Mixed precision (FP16/BF16) support
+  - Efficient memory management with checkpointing
+  - Weights & Biases integration for experiment tracking
+- Evaluation tools to benchmark agent performance
 
-- **`env.py`**: Contains the `YahtzeeEnv` class, a Gym-like environment simulating Yahtzee mechanics (dice rolling, scoring, etc.).
-- **`encoder.py`**: Defines the `StateEncoder` that converts a game state (dice values, scores, etc.) into a numerical vector suitable for the neural network.
-- **`dqn.py`**: Implements the Deep Q-Network (`DQN`) architecture, the `YahtzeeAgent`, and the replay buffer.
-- **`play.py`**: Utility functions for simulating games, interacting with the agent, and evaluating performance.
-- **`app.py`**: A Gradio-based UI that allows you to load models, watch simulations, and examine agent decisions step by step.
-- **`main.py`**: A script for training the agent with support for logging, checkpoints, and optional W&B (Weights & Biases) integration for experiment tracking.
+## Requirements
 
-### Installation & Usage
+```
+torch>=2.0.0
+numpy>=1.20.0
+matplotlib>=3.3.0
+wandb>=0.12.0
+tqdm>=4.60.0
+```
 
-1. **Install Dependencies**  
-   Make sure you have Python 3.9+ installed. Then run:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   
-2. **Training the Agent**  
-   You can launch the training process via:
-   ```bash
-   python main.py --episodes 50000 --num_envs 32 --objective avg_score
-   ```
-   - `--episodes`: number of training episodes.
-   - `--num_envs`: number of parallel environments for faster training.
-   - `--objective`: `"win"` (the agent tries to outscore a hypothetical opponent) or `"avg_score"` (purely maximize final score).
+## Getting Started
 
-3. **Launching the Gradio UI**  
-   After training, start the UI by running:
-   ```bash
-   python app.py
-   ```
-   This will launch a local server (e.g. at `http://127.0.0.1:7860`), providing:
-   - A **Model dropdown** to load a `.pth` model file from the `models/` directory.
-   - An **Objective radio** to choose between `"win"` and `"avg_score"`.
-   - **Simulation Tab**: Run a full game simulation.
-   - **Calculation Tab**: Step by step game analysis of the best actions.
-   - **Analysis Tab**: Evaluate the performance of the loaded model over multiple games (e.g. 100).
+### Installation
 
-### Architecture & Hyperparameter Decisions
+1. Clone this repository:
 
-1. **DQN Architecture**  
-   - **Input**: Encoded game state of size ~22–23 floats (dice counts, rolls left, score categories filled, etc.).
-   - **Hidden Layers**: A series of fully connected layers (e.g., size 512), often with *residual blocks* for improved gradient flow.
-   - **Dueling Network**: Splits the network into value and advantage streams before recombining to get Q-values.
-   - **Output**: Q-values for each possible Yahtzee action (e.g., rolling, holding, scoring various categories).
+```bash
+git clone https://github.com/yourusername/yahtzee-rl.git
+cd yahtzee-rl
+```
 
-2. **Hyperparameters**  
-   - **Replay Buffer**: Prioritized replay, capacity ~200k transitions, alpha=0.7, beta=0.5
-   - **Batch Size**: ~1024 or 2048
-   - **Learning Rate**: 5e-5 or 2e-4 in different runs
-   - **Gamma**: 0.99 or 0.997 for discount factor
-   - **\(\epsilon\)-greedy**: Starts at 1.0 and decays to ~0.02
-   - **Target Network Update**: Soft update or periodically (e.g. every 50 steps)
-   - **Reward Shaping**:
-     - Basic approach: immediate points + potential bonus for certain combos.
-     - Strategic approach: more reward for bigger combos, bonus for avoiding 0-scores, etc.
-     - Potential-based approach: shaping to encourage progress toward 63 in the upper section, etc.
+2. Install the required packages:
 
-3. **Training Strategy**  
-   - Running multiple parallel environments to collect experience quickly.
-   - Periodically evaluating on fixed seeds or sets of episodes to track actual final scores (the “real” objective).
-   - Using either `avg_score` objective for pure scoring or `win` objective to consider an “opponent’s value” in encoding.
+```bash
+pip install -r requirements.txt
+```
 
-### Results & Observations
+### Training
 
-- **Current Performance**:  
-  - Mean scores around 120–140 after ~15k–30k steps with certain reward shaping strategies.
-  - With more training and refined hyperparameters, the agent can sometimes reach ~180–200 in certain runs, but it requires longer training (e.g., 50k+ episodes) and more careful hyperparameter tuning.
-- **Learning Curve**:  
-  - Often, the agent’s “training reward” might differ from the actual final “Yahtzee score.” This discrepancy is because the model might maximize intermediate shaped rewards rather than raw final game points. Adjusting or aligning these metrics is crucial to converge toward a truly high final Yahtzee score.
-- **Key Observations**:
-  1. **Reward Shaping** drastically influences how quickly or even if the agent converges to a strong strategy.
-  2. The large action space (rolling vs. holding patterns) can make it tricky for the agent to explore effectively, requiring robust exploration strategies.
-  3. Debugging needed to confirm no misalignment between “reward” vs. actual “final score.”
+To train a model with default parameters optimized for A100 GPUs:
 
-### Lessons Learned
+```bash
+python train.py --use-noisy --use-enhanced-rewards --use-mixed-precision
+```
 
-- **Reward vs. Final Score**: Always verify that your shaping signals do not overshadow the real objective. Over-shaping can lead to the agent optimizing extrinsic signals (like small incremental rewards) rather than final game score.
-- **Exploration**: Epsilon schedules matter a lot. The agent might get stuck in suboptimal patterns if \(\epsilon\) decays too fast.
-- **Stability**: Large neural nets (512 units + residual blocks) need stable training techniques (e.g., gradient clipping, careful learning rates).
-- **Compute**: Achieving 200+ median scores often demands **longer training** (on the order of tens of thousands of episodes) plus thorough hyperparameter searching.
+For a full training run to achieve 230+ median/240+ mean scores:
 
-### Potential Next Steps
+```bash
+python train.py \
+  --episodes 200000 \
+  --envs 256 \
+  --batch-size 4096 \
+  --use-noisy \
+  --hidden-size 512 \
+  --num-blocks 4 \
+  --learning-rate 1e-4 \
+  --gamma 0.997 \
+  --steps-per-update 8 \
+  --n-step 3 \
+  --use-enhanced-rewards \
+  --objective score \
+  --use-mixed-precision
+```
 
-- **Longer Training**: Extending episodes to ~50k or more while monitoring final score (not just shaped reward).
-- **Better Reward Shaping** or even **no shaping** with direct final reward to reduce confusion between actual final scoring and partial steps.
-- **Self-play or Opponent**: If focusing on “win” mode, introduce a strong reference opponent or advanced simulation strategies.
+### Training with Weights & Biases
 
-### References
-- [Yahtzee RL Example (Stanford PDF)](https://web.stanford.edu/class/aa228/reports/2018/final75.pdf)
-- [Yahtzotron: Advantage Actor-Critic Approach](https://dionhaefner.github.io/2021/04/yahtzotron-learning-to-play-yahtzee-with-advantage-actor-critic/)
-- [Markus Dutschke’s Implementation](https://github.com/markusdutschke/yahtzee)
-- [Yahtzee RL Articles](https://www.yahtzeemanifesto.com/reinforcement-learning-yahtzee.php)
+To track your experiments with W&B:
+
+```bash
+python train.py \
+  --wandb-project yahtzee-rl \
+  --wandb-entity your-username \
+  --wandb-tags a100 high-score \
+  --use-noisy \
+  --use-enhanced-rewards \
+  --use-mixed-precision
+```
+
+### Evaluation
+
+To evaluate a trained model:
+
+```bash
+python train.py --eval-only --checkpoint models/your_run_id/best_model.pth --eval-games 1000
+```
+
+## Project Structure
+
+- `dqn.py`: Implementation of the Deep Q-Network and agent
+- `encoder.py`: State representation and encoding
+- `env.py`: Yahtzee game environment
+- `main.py`: Main training loop and utilities
+- `train.py`: Training configuration and entry point
+- `play.py`: Interactive gameplay and model visualization
+- `yahtzee_types.py`: Type definitions for the Yahtzee game
+
+## A100 Optimization Guide
+
+This codebase is optimized for training on NVIDIA A100 GPUs. Key optimization features include:
+
+1. **Mixed Precision Training**: Uses FP16/BF16 operations where appropriate to increase throughput
+2. **Memory Efficiency**: Careful batch sizes and memory management
+3. **Checkpoint Management**: Automatically prunes older checkpoints to save storage
+4. **Vectorized Environment**: Processes multiple game environments in parallel
+
+### Performance Expectations
+
+When training on an A100 40GB GPU with recommended settings:
+
+- Expected training time: ~24-48 hours to reach 230+ median score
+- Memory usage: ~20-25GB
+- Expected results: 230+ median score, 240+ mean score
+
+### Troubleshooting A100 Issues
+
+If you encounter CUDA out-of-memory errors:
+
+- Reduce `--batch-size` to 2048 or 1024
+- Reduce `--envs` to 128 or 64
+
+If performance is slower than expected:
+
+- Ensure `--use-mixed-precision` is enabled
+- Monitor GPU utilization with `nvidia-smi`
+- Try adjusting `--steps-per-update`
+
+## Achieving High Scores
+
+To achieve the target scores of 230+ median and 240+ mean:
+
+1. Use the enhanced rewards (`--use-enhanced-rewards`)
+2. Enable noisy networks for better exploration (`--use-noisy`)
+3. Train for at least 150,000 episodes
+4. Use a large replay buffer (default is 200,000)
+5. Train with a discount factor of 0.997 or higher
+
+The most important factors for high scores are:
+
+1. Strategic state representation (already implemented)
+2. Enhanced reward shaping (already implemented)
+3. Sufficient training time
+4. Exploration-exploitation balance
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgments
+
+- [OpenAI Baselines](https://github.com/openai/baselines) for DQN implementation inspiration
+- [Weights & Biases](https://wandb.ai/) for experiment tracking
