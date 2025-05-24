@@ -1,5 +1,6 @@
 import os
 import random
+import math
 from collections import namedtuple
 from typing import Dict, List, Optional
 
@@ -8,31 +9,100 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
 
 Transition = namedtuple(
     "Transition", ("state", "action", "reward", "next_state", "done")
 )
 
 
-class DQN(nn.Module):
-    """Basic DQN model for Yahtzee."""
+class NoisyLinear(nn.Module):
+    """Noisy linear layer for exploration."""
 
-    def __init__(self, state_size: int, action_size: int) -> None:
+    def __init__(self, in_features: int, out_features: int, std_init: float = 0.5) -> None:
         super().__init__()
-        self.state_size = state_size
-        self.action_size = action_size
+        self.in_features = in_features
+        self.out_features = out_features
+        self.std_init = std_init
 
-        # Simple feed-forward network
-        self.network = nn.Sequential(
-            nn.Linear(state_size, 128),
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        self.register_buffer("bias_epsilon", torch.empty(out_features))
+
+        self.reset_parameters()
+        self.sample_noise()
+
+    def reset_parameters(self) -> None:
+        mu_range = 1.0 / math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
+        self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))
+
+    def sample_noise(self) -> None:
+        epsilon_in = torch.randn(self.in_features, device=self.weight_mu.device)
+        epsilon_out = torch.randn(self.out_features, device=self.weight_mu.device)
+        self.weight_epsilon = epsilon_out.ger(epsilon_in)
+        self.bias_epsilon = epsilon_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return F.linear(x, weight, bias)
+
+
+class DQN(nn.Module):
+    """Dueling DQN with optional noisy layers."""
+
+    def __init__(
+        self,
+        state_size: int,
+        action_size: int,
+        hidden_size: int = 128,
+        use_noisy: bool = False,
+    ) -> None:
+        super().__init__()
+        self.use_noisy = use_noisy
+        linear = NoisyLinear if use_noisy else nn.Linear
+
+        self.feature = nn.Sequential(
+            linear(state_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, action_size),
         )
 
+        self.value_stream = nn.Sequential(
+            linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            linear(hidden_size, 1),
+        )
+
+        self.adv_stream = nn.Sequential(
+            linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            linear(hidden_size, action_size),
+        )
+
+    def sample_noise(self) -> None:
+        if not self.use_noisy:
+            return
+        for m in self.modules():
+            if isinstance(m, NoisyLinear):
+                m.sample_noise()
+
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.network(state)
+        feat = self.feature(state)
+        value = self.value_stream(feat)
+        adv = self.adv_stream(feat)
+        q = value + adv - adv.mean(1, keepdim=True)
+        return q
 
 
 class YahtzeeAgent:
@@ -43,18 +113,23 @@ class YahtzeeAgent:
         state_size: int,
         action_size: int,
         batch_size: int = 2048,
-        gamma: float = 0.97,  # lowered from 0.99
+        gamma: float = 0.97,
         learning_rate: float = 3e-4,
         target_update: int = 50,
-        device: str = "auto",  # Changed to auto by default
+        device: str = "auto",
         min_epsilon: float = 0.02,
         epsilon_decay: float = 0.9995,
+        hidden_size: int = 128,
+        use_noisy: bool = False,
+        use_amp: bool = False,
     ) -> None:
         self.state_size = state_size
         self.action_size = action_size
         self.batch_size = batch_size
         self.gamma = gamma
         self.target_update = target_update
+        self.use_amp = use_amp
+        self.scaler: Optional[GradScaler] = GradScaler() if use_amp else None
 
         # Handle device selection
         if device == "auto":
@@ -70,9 +145,10 @@ class YahtzeeAgent:
         self.metrics: Dict[str, float] = {}
 
         # Networks
-        self.policy_net = DQN(state_size, action_size).to(self.device)
-        self.target_net = DQN(state_size, action_size).to(self.device)
+        self.policy_net = DQN(state_size, action_size, hidden_size, use_noisy).to(self.device)
+        self.target_net = DQN(state_size, action_size, hidden_size, use_noisy).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.use_noisy = use_noisy
 
         for param in self.target_net.parameters():
             param.requires_grad = False
@@ -130,6 +206,9 @@ class YahtzeeAgent:
         next_states: List[np.ndarray],
         dones: List[bool],
     ) -> float:
+        if self.use_noisy:
+            self.policy_net.sample_noise()
+            self.target_net.sample_noise()
         # Store transitions
         for s, a, r, ns, d in zip(
             states, actions, rewards, next_states, dones
@@ -165,23 +244,27 @@ class YahtzeeAgent:
             [t.done for t in batch], dtype=torch.float
         ).to(self.device)
 
-        # Current Q-values
-        current_q = self.policy_net(states_t).gather(
-            1, actions_t.unsqueeze(1)
-        )
+        # Current Q-values and targets
+        with autocast(enabled=self.use_amp):
+            current_q = self.policy_net(states_t).gather(
+                1, actions_t.unsqueeze(1)
+            )
 
-        # Next Q-values
-        with torch.no_grad():
-            next_q = self.target_net(next_states_t).max(1)[0]
-            target_q = rewards_t + (1 - dones_t) * self.gamma * next_q
+            with torch.no_grad():
+                next_q = self.target_net(next_states_t).max(1)[0]
+                target_q = rewards_t + (1 - dones_t) * self.gamma * next_q
 
-        # Calculate loss
-        loss = F.smooth_l1_loss(current_q, target_q.unsqueeze(1))
+            loss = F.smooth_l1_loss(current_q, target_q.unsqueeze(1))
 
         # Optimize
         self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        if self.use_amp and self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
 
         # Update target network
         self.learn_steps += 1

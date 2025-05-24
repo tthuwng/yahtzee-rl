@@ -290,6 +290,9 @@ def train(
     use_enhanced_rewards: bool = True,
     batch_size: int = 2048,
     learning_rate: float = 1e-4,
+    hidden_size: int = 128,
+    use_noisy: bool = False,
+    use_mixed_precision: bool = False,
 ) -> None:
     """
     Train the DQN agent using vectorized environments.
@@ -356,6 +359,9 @@ def train(
         gamma=0.997,
         target_update=50,
         device=str(device),
+        hidden_size=hidden_size,
+        use_noisy=use_noisy,
+        use_amp=use_mixed_precision,
     )
 
     # Load checkpoint if provided
@@ -712,6 +718,16 @@ def parse_args() -> argparse.Namespace:
         default=128,
         help="Size of hidden layers in the model",
     )
+    parser.add_argument(
+        "--use-noisy",
+        action="store_true",
+        help="Use noisy networks for exploration",
+    )
+    parser.add_argument(
+        "--use-mixed-precision",
+        action="store_true",
+        help="Enable mixed precision training",
+    )
 
     # Training hyperparameters
     parser.add_argument(
@@ -875,6 +891,9 @@ def run_evaluation_only(args: argparse.Namespace) -> None:
         learning_rate=args.learning_rate,
         gamma=args.gamma,
         device=device,
+        hidden_size=args.hidden_size,
+        use_noisy=args.use_noisy,
+        use_amp=args.use_mixed_precision,
     )
 
     # Load checkpoint
@@ -949,6 +968,9 @@ def main() -> None:
         wandb_project=args.wandb_project,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        hidden_size=args.hidden_size,
+        use_noisy=args.use_noisy,
+        use_mixed_precision=args.use_mixed_precision,
     )
 
 
