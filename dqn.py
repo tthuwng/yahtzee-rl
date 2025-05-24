@@ -42,20 +42,28 @@ class YahtzeeAgent:
         self,
         state_size: int,
         action_size: int,
-        batch_size: int = 64,
-        gamma: float = 0.99,
-        learning_rate: float = 1e-4,
-        target_update: int = 10,
-        device: str = "cuda",
-        min_epsilon: float = 0.01,
-        epsilon_decay: float = 0.995,
+        batch_size: int = 2048,
+        gamma: float = 0.97,  # lowered from 0.99
+        learning_rate: float = 3e-4,
+        target_update: int = 50,
+        device: str = "auto",  # Changed to auto by default
+        min_epsilon: float = 0.02,
+        epsilon_decay: float = 0.9995,
     ) -> None:
         self.state_size = state_size
         self.action_size = action_size
         self.batch_size = batch_size
         self.gamma = gamma
         self.target_update = target_update
-        self.device = torch.device(device)
+
+        # Handle device selection
+        if device == "auto":
+            self.device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+        else:
+            self.device = torch.device(device)
+
         self.learn_steps = 0
         self.training_mode = True
         self.latest_loss: Optional[float] = None
